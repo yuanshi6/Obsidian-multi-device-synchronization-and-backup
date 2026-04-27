@@ -1,5 +1,5 @@
 import {App, Notice, PluginSettingTab, Setting} from "obsidian";
-import {HeadBucketCommand, S3Client} from "@aws-sdk/client-s3";
+import {ListObjectsV2Command, S3Client} from "@aws-sdk/client-s3";
 import S3SyncPlugin from "./main";
 
 export interface S3BackupSettings {
@@ -148,30 +148,122 @@ export class S3SyncSettingTab extends PluginSettingTab {
 				}));
 	}
 
-	private async testConnection(): Promise<void> {
-		const {accessKey, secretKey, endpoint, region, bucketName} = this.plugin.settings;
+	private cleanEndpoint(endpoint: string, bucketName: string): string {
+		let cleaned = endpoint.trim();
 
-		if (!accessKey || !secretKey || !endpoint || !bucketName) {
-			new Notice("请先填写完整的 AK/SK、Endpoint 和 Bucket Name");
+		// 补全协议头
+		if (!/^https?:\/\//.test(cleaned)) {
+			cleaned = "https://" + cleaned;
+		}
+
+		// 移除末尾斜杠
+		cleaned = cleaned.replace(/\/+$/, "");
+
+		// 如果 endpoint 中包含了桶名（如 https://bucket-name.cos.ap-chongqing.myqcloud.com），移除桶名
+		if (bucketName) {
+			const escaped = bucketName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+			cleaned = cleaned.replace(new RegExp(`^https?://${escaped}\\.`), "https://");
+		}
+
+		return cleaned;
+	}
+
+	private async testConnection(): Promise<void> {
+		const {accessKey, secretKey, region, bucketName} = this.plugin.settings;
+		const rawEndpoint = this.plugin.settings.endpoint;
+		const endpoint = this.cleanEndpoint(rawEndpoint, bucketName);
+
+		console.log("[S3 Sync] 测试连接 — 配置参数：", {
+			Endpoint: endpoint,
+			"Raw Endpoint": rawEndpoint,
+			Bucket: bucketName,
+			Region: region || "us-east-1",
+			AK: accessKey ? `${accessKey.slice(0, 4)}****` : "(空)",
+			SK: secretKey ? "****" : "(空)",
+		});
+
+		// 逐项校验
+		const missing: string[] = [];
+		if (!accessKey) missing.push("Access Key");
+		if (!secretKey) missing.push("Secret Key");
+		if (!rawEndpoint) missing.push("Endpoint");
+		if (!bucketName) missing.push("Bucket Name");
+		if (missing.length > 0) {
+			console.warn("[S3 Sync] 测试连接 — 缺失配置项：", missing);
+			new Notice(`请先填写：${missing.join("、")}`, 6000);
 			return;
+		}
+
+		// SK 空格检查
+		if (secretKey !== secretKey.trim()) {
+			console.warn("[S3 Sync] 测试连接 — Secret Key 包含首尾空格，已自动去除");
+		}
+
+		// Endpoint 自动修正
+		const endpointChanged = endpoint !== rawEndpoint.trim().replace(/\/+$/, "");
+		if (endpointChanged) {
+			console.log("[S3 Sync] 测试连接 — Endpoint 已自动修正：", rawEndpoint, "→", endpoint);
+			new Notice(`Endpoint 已自动修正为：${endpoint}`, 6000);
 		}
 
 		try {
 			const client = new S3Client({
 				credentials: {
-					accessKeyId: accessKey,
-					secretAccessKey: secretKey,
+					accessKeyId: accessKey.trim(),
+					secretAccessKey: secretKey.trim(),
 				},
 				endpoint: endpoint,
 				region: region || "us-east-1",
-				forcePathStyle: true,
+				forcePathStyle: false,
 			});
 
-			await client.send(new HeadBucketCommand({Bucket: bucketName}));
-			new Notice("连接成功！存储桶可访问。");
+			console.log("[S3 Sync] 测试连接 — 发送 ListObjectsV2Command (MaxKeys:1)…");
+			const result = await client.send(new ListObjectsV2Command({
+				Bucket: bucketName,
+				MaxKeys: 1,
+			}));
+
+			console.log("[S3 Sync] 测试连接 — 成功！", {
+				Name: result.Name,
+				IsTruncated: result.IsTruncated,
+				KeyCount: result.KeyCount,
+			});
+			new Notice(`连接成功！\nBucket: ${result.Name ?? bucketName}\nEndpoint: ${endpoint}\nRegion: ${region || "us-east-1"}`, 6000);
 		} catch (err: unknown) {
-			const message = err instanceof Error ? err.message : String(err);
-			new Notice(`连接失败：${message}`, 8000);
+			const errMessage = err instanceof Error ? err.message : String(err);
+			const errName = (err as { name?: string })?.name ?? "UnknownError";
+			const metadata = (err as { $metadata?: { httpStatusCode?: number; requestId?: string; extendedRequestId?: string } })?.$metadata;
+			const httpStatus = metadata?.httpStatusCode;
+			const requestId = metadata?.requestId ?? metadata?.extendedRequestId ?? "无";
+
+			console.error("[S3 Sync] 测试连接 — 失败，完整错误对象：", err);
+			console.error("[S3 Sync] 测试连接 — 错误详情：", {
+				name: errName,
+				message: errMessage,
+				httpStatusCode: httpStatus,
+				requestId: requestId,
+				Endpoint: endpoint,
+				Bucket: bucketName,
+				Region: region || "us-east-1",
+				AK: accessKey.trim().slice(0, 4) + "****",
+			});
+
+			let hint = "";
+			if (httpStatus === 403) {
+				hint = "\n\n403 排查建议：\n1. 检查子账号是否有 cos:GetBucket 权限\n2. 检查电脑系统时间是否准确\n3. 检查 Secret Key 是否包含多余空格";
+			}
+
+			new Notice(
+				`连接失败 [${errName}] HTTP ${httpStatus ?? "?"}\n` +
+				`Endpoint: ${endpoint}\n` +
+				`Bucket: ${bucketName}\n` +
+				`Region: ${region || "us-east-1"}\n` +
+				`AK: ${accessKey.trim().slice(0, 4)}****\n` +
+				`RequestId: ${requestId}\n` +
+				`错误: ${errMessage}` +
+				hint,
+				12000,
+			);
 		}
 	}
 }

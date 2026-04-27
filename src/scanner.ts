@@ -1,10 +1,18 @@
-import {DataAdapter, Stat} from "obsidian";
+import {DataAdapter} from "obsidian";
 import {S3BackupSettings} from "./settings";
 
 // ── 路径标准化：确保跨平台兼容（Windows \ → /）──
 
 export function normalizeSyncPath(path: string): string {
 	return path.split("\\").join("/");
+}
+
+const SYSTEM_FILE_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+
+function isSystemFile(path: string): boolean {
+	const parts = path.split("/");
+	const fileName = parts[parts.length - 1] ?? "";
+	return SYSTEM_FILE_NAMES.has(fileName);
 }
 
 // ── Manifest 类型定义 ──
@@ -72,7 +80,7 @@ export class FileScanner {
 		const {files, folders} = await this.adapter.list(dir);
 
 		for (const filePath of files) {
-			if (this.isExcluded(filePath)) continue;
+			if (this.isExcluded(filePath) || isSystemFile(filePath)) continue;
 			const stat = await this.adapter.stat(filePath);
 			if (stat && stat.mtime != null) {
 				result[normalizeSyncPath(filePath)] = {mtime: stat.mtime, size: stat.size};
