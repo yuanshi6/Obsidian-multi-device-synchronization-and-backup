@@ -146,6 +146,45 @@ export class S3SyncSettingTab extends PluginSettingTab {
 					this.plugin.settings.excludePatterns = value;
 					await this.plugin.saveSettings();
 				}));
+
+		// ── 测试与调试 ──
+		containerEl.createEl("h3", {text: "测试与调试"});
+
+		new Setting(containerEl)
+			.setName("执行全面同步与清理测试")
+			.setDesc("此操作将获取云端列表、清理未同步的孤儿文件，并执行完整的增量同步。请务必打开开发者控制台 (Ctrl+Shift+I) 查看详细结构化日志。")
+			.addButton(btn => {
+				btn.setButtonText("🚀 运行测试")
+					.setCta()
+					.onClick(async () => {
+						btn.setDisabled(true);
+						btn.setButtonText("⏳ 正在测试...");
+						new Notice("开始执行 S3 同步测试，请盯紧控制台！");
+
+						try {
+							const {S3TransferManager} = await import("./transfer");
+							const manager = new S3TransferManager(this.app.vault, this.plugin.settings);
+							const deviceId = await this.plugin.getDeviceId();
+							const result = await manager.fullSync(deviceId);
+
+							const lines: string[] = [];
+							if (result.uploaded > 0) lines.push(`上传 ${result.uploaded}`);
+							if (result.downloaded > 0) lines.push(`下载 ${result.downloaded}`);
+							if (result.deleted > 0) lines.push(`删除 ${result.deleted}`);
+							if (result.orphanCleaned > 0) lines.push(`清理孤儿 ${result.orphanCleaned}`);
+							if (result.failed.length > 0) lines.push(`失败 ${result.failed.length}`);
+
+							new Notice(`✅ 测试与同步圆满完成！${lines.length > 0 ? " " + lines.join("，") : ""}`);
+						} catch (err: unknown) {
+							const msg = err instanceof Error ? err.message : String(err);
+							console.error("[S3 Sync] 测试失败：", err);
+							new Notice(`❌ 测试失败：${msg}`, 8000);
+						} finally {
+							btn.setDisabled(false);
+							btn.setButtonText("🚀 运行测试");
+						}
+					});
+			});
 	}
 
 	private cleanEndpoint(endpoint: string, bucketName: string): string {

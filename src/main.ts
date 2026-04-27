@@ -1,4 +1,4 @@
-import {Notice, Plugin} from "obsidian";
+import {Notice, Plugin, TFile, TFolder} from "obsidian";
 import {DEFAULT_SETTINGS, S3BackupSettings, S3SyncSettingTab} from "./settings";
 import {S3TransferManager} from "./transfer";
 
@@ -13,13 +13,17 @@ function generateDeviceId(): string {
 
 type SyncPhase = "idle" | "scanning" | "uploading" | "downloading" | "deleting" | "done";
 
+const DEBOUNCE_MS = 5000;
+
 export default class S3SyncPlugin extends Plugin {
 	settings: S3BackupSettings;
 	private deviceId = "";
 	private syncing = false;
 	private syncTimer: number | null = null;
+	private debounceTimer: number | null = null;
 	private statusBarItem: HTMLElement | null = null;
 	private beforeUnloadHandler: ((evt: BeforeUnloadEvent) => void) | null = null;
+	private visibilityHandler: (() => void) | null = null;
 
 	async onload() {
 		await this.loadSettings();
@@ -47,28 +51,59 @@ export default class S3SyncPlugin extends Plugin {
 		// 定时自动同步
 		this.setupAutoSync();
 
-		// 退出拦截
+		// 5 分钟后台定时同步（始终运行，不受 autoSync 开关影响）
+		this.registerInterval(window.setInterval(() => {
+			if (!navigator.onLine) {
+				console.log("[S3 Sync] 📴 当前离线，跳过定时同步");
+				return;
+			}
+			console.log("[S3 Sync] ⏰ 触发 5 分钟后台定时同步检查...");
+			this.startSync(true);
+		}, 5 * 60 * 1000));
+
+		// 事件防抖同步：监听文件变更，5秒无新操作后自动同步
+		this.registerEvent(this.app.vault.on("modify", () => this.scheduleDebouncedSync()));
+		this.registerEvent(this.app.vault.on("create", () => this.scheduleDebouncedSync()));
+		this.registerEvent(this.app.vault.on("delete", () => this.scheduleDebouncedSync()));
+		this.registerEvent(this.app.vault.on("rename", () => this.scheduleDebouncedSync()));
+
+		// 电脑端退出拦截
 		this.beforeUnloadHandler = (evt: BeforeUnloadEvent) => {
 			this.onBeforeUnload();
-			// 如果正在同步，请求延迟关闭
 			if (this.syncing) {
 				evt.preventDefault();
 			}
 		};
 		window.addEventListener("beforeunload", this.beforeUnloadHandler);
+
+		// 移动端挂起同步：App 切到后台时触发紧急同步
+		this.visibilityHandler = () => {
+			if (document.visibilityState === "hidden") {
+				this.onAppSuspend();
+			}
+		};
+		document.addEventListener("visibilitychange", this.visibilityHandler);
 	}
 
 	onunload() {
-		// 插件卸载时也触发一次快速同步
+		// 插件卸载时触发快速同步
 		this.onBeforeUnload();
 
 		if (this.syncTimer !== null) {
 			window.clearInterval(this.syncTimer);
 			this.syncTimer = null;
 		}
+		if (this.debounceTimer !== null) {
+			window.clearTimeout(this.debounceTimer);
+			this.debounceTimer = null;
+		}
 		if (this.beforeUnloadHandler) {
 			window.removeEventListener("beforeunload", this.beforeUnloadHandler);
 			this.beforeUnloadHandler = null;
+		}
+		if (this.visibilityHandler) {
+			document.removeEventListener("visibilitychange", this.visibilityHandler);
+			this.visibilityHandler = null;
 		}
 	}
 
@@ -124,7 +159,23 @@ export default class S3SyncPlugin extends Plugin {
 		}, ms);
 	}
 
-	// ── 退出拦截：快速合并提交 ──
+	// ── 事件防抖同步 ──
+
+	private scheduleDebouncedSync(): void {
+		if (!this.settings.autoSync && !this.settings.accessKey) return;
+
+		if (this.debounceTimer !== null) {
+			window.clearTimeout(this.debounceTimer);
+		}
+
+		this.debounceTimer = window.setTimeout(() => {
+			this.debounceTimer = null;
+			console.log("[S3 Sync] 防抖触发：文件变更后自动同步");
+			this.startSync(true);
+		}, DEBOUNCE_MS);
+	}
+
+	// ── 电脑端退出拦截 ──
 
 	private onBeforeUnload(): void {
 		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
@@ -136,7 +187,6 @@ export default class S3SyncPlugin extends Plugin {
 
 		try {
 			const manager = new S3TransferManager(this.app.vault, this.settings);
-			// 使用 .then() 不阻塞关闭流程
 			manager.quickSync(this.deviceId, 5 * 60 * 1000)
 				.then((syncResult) => {
 					console.log("[S3 Sync] 退出同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
@@ -153,9 +203,37 @@ export default class S3SyncPlugin extends Plugin {
 		}
 	}
 
+	// ── 移动端挂起同步 ──
+
+	private onAppSuspend(): void {
+		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
+		if (!accessKey || !secretKey || !endpoint || !bucketName) return;
+		if (this.syncing) return;
+
+		this.syncing = true;
+		console.log("[S3 Sync] App 挂起，触发紧急同步…");
+
+		try {
+			const manager = new S3TransferManager(this.app.vault, this.settings);
+			manager.quickSync(this.deviceId, 5 * 60 * 1000)
+				.then((syncResult) => {
+					console.log("[S3 Sync] 挂起同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
+				})
+				.catch((err: unknown) => {
+					console.error("[S3 Sync] 挂起同步失败：", err);
+				})
+				.finally(() => {
+					this.syncing = false;
+				});
+		} catch (err: unknown) {
+			console.error("[S3 Sync] 挂起同步异常：", err);
+			this.syncing = false;
+		}
+	}
+
 	// ── 设备 ID ──
 
-	private async getDeviceId(): Promise<string> {
+	async getDeviceId(): Promise<string> {
 		const stored = this.app.loadLocalStorage("s3-sync-device-id");
 		if (stored) return stored;
 
