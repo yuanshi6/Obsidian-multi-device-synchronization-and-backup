@@ -1,99 +1,201 @@
-import {App, Editor, MarkdownView, Modal, Notice, Plugin} from 'obsidian';
-import {DEFAULT_SETTINGS, MyPluginSettings, SampleSettingTab} from "./settings";
+import {Notice, Plugin} from "obsidian";
+import {DEFAULT_SETTINGS, S3BackupSettings, S3SyncSettingTab} from "./settings";
+import {S3TransferManager} from "./transfer";
 
-// Remember to rename these classes and interfaces!
+function generateDeviceId(): string {
+	const chars = "abcdefghijklmnopqrstuvwxyz0123456789";
+	let id = "";
+	for (let i = 0; i < 8; i++) {
+		id += chars[Math.floor(Math.random() * chars.length)];
+	}
+	return id;
+}
 
-export default class MyPlugin extends Plugin {
-	settings: MyPluginSettings;
+type SyncPhase = "idle" | "scanning" | "uploading" | "downloading" | "done";
+
+export default class S3SyncPlugin extends Plugin {
+	settings: S3BackupSettings;
+	private deviceId = "";
+	private syncing = false;
+	private syncTimer: number | null = null;
+	private statusBarItem: HTMLElement | null = null;
+	private beforeUnloadHandler: ((evt: BeforeUnloadEvent) => void) | null = null;
 
 	async onload() {
 		await this.loadSettings();
+		this.deviceId = await this.getDeviceId();
 
-		// This creates an icon in the left ribbon.
-		this.addRibbonIcon('dice', 'Sample', (evt: MouseEvent) => {
-			// Called when the user clicks the icon.
-			new Notice('This is a notice!');
+		// Ribbon 图标
+		this.addRibbonIcon("refresh-cw", "S3 Sync", () => {
+			this.startSync();
 		});
 
-		// This adds a status bar item to the bottom of the app. Does not work on mobile apps.
-		const statusBarItemEl = this.addStatusBarItem();
-		statusBarItemEl.setText('Status bar text');
-
-		// This adds a simple command that can be triggered anywhere
+		// 命令面板
 		this.addCommand({
-			id: 'open-modal-simple',
-			name: 'Open modal (simple)',
-			callback: () => {
-				new SampleModal(this.app).open();
+			id: "s3-sync-now",
+			name: "同步到 S3",
+			callback: () => this.startSync(),
+		});
+
+		// 设置页
+		this.addSettingTab(new S3SyncSettingTab(this.app, this));
+
+		// 状态栏
+		this.statusBarItem = this.addStatusBarItem();
+		this.updateStatusBar("idle");
+
+		// 定时自动同步
+		this.setupAutoSync();
+
+		// 退出拦截
+		this.beforeUnloadHandler = (evt: BeforeUnloadEvent) => {
+			if (this.syncing) {
+				evt.preventDefault();
 			}
-		});
-		// This adds an editor command that can perform some operation on the current editor instance
-		this.addCommand({
-			id: 'replace-selected',
-			name: 'Replace selected content',
-			editorCallback: (editor: Editor, view: MarkdownView) => {
-				editor.replaceSelection('Sample editor command');
-			}
-		});
-		// This adds a complex command that can check whether the current state of the app allows execution of the command
-		this.addCommand({
-			id: 'open-modal-complex',
-			name: 'Open modal (complex)',
-			checkCallback: (checking: boolean) => {
-				// Conditions to check
-				const markdownView = this.app.workspace.getActiveViewOfType(MarkdownView);
-				if (markdownView) {
-					// If checking is true, we're simply "checking" if the command can be run.
-					// If checking is false, then we want to actually perform the operation.
-					if (!checking) {
-						new SampleModal(this.app).open();
-					}
-
-					// This command will only show up in Command Palette when the check function returns true
-					return true;
-				}
-				return false;
-			}
-		});
-
-		// This adds a settings tab so the user can configure various aspects of the plugin
-		this.addSettingTab(new SampleSettingTab(this.app, this));
-
-		// If the plugin hooks up any global DOM events (on parts of the app that doesn't belong to this plugin)
-		// Using this function will automatically remove the event listener when this plugin is disabled.
-		this.registerDomEvent(document, 'click', (evt: MouseEvent) => {
-			new Notice("Click");
-		});
-
-		// When registering intervals, this function will automatically clear the interval when the plugin is disabled.
-		this.registerInterval(window.setInterval(() => console.log('setInterval'), 5 * 60 * 1000));
-
+			this.onBeforeUnload();
+		};
+		window.addEventListener("beforeunload", this.beforeUnloadHandler);
 	}
 
 	onunload() {
+		if (this.syncTimer !== null) {
+			window.clearInterval(this.syncTimer);
+			this.syncTimer = null;
+		}
+		if (this.beforeUnloadHandler) {
+			window.removeEventListener("beforeunload", this.beforeUnloadHandler);
+			this.beforeUnloadHandler = null;
+		}
 	}
 
 	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<MyPluginSettings>);
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData() as Partial<S3BackupSettings>);
 	}
 
 	async saveSettings() {
 		await this.saveData(this.settings);
 	}
-}
 
-class SampleModal extends Modal {
-	constructor(app: App) {
-		super(app);
+	// ── 状态栏 ──
+
+	private updateStatusBar(phase: SyncPhase, progress?: { done: number; total: number }): void {
+		if (!this.statusBarItem) return;
+
+		switch (phase) {
+			case "idle":
+				this.statusBarItem.setText("☁ 就绪");
+				break;
+			case "scanning":
+				this.statusBarItem.setText("🔄 扫描中…");
+				break;
+			case "uploading":
+				this.statusBarItem.setText(`🔄 上传中 (${progress?.done ?? 0}/${progress?.total ?? 0})`);
+				break;
+			case "downloading":
+				this.statusBarItem.setText(`🔄 下载中 (${progress?.done ?? 0}/${progress?.total ?? 0})`);
+				break;
+			case "done":
+				this.statusBarItem.setText("✅ 同步完成");
+				setTimeout(() => this.updateStatusBar("idle"), 3000);
+				break;
+		}
 	}
 
-	onOpen() {
-		let {contentEl} = this;
-		contentEl.setText('Woah!');
+	// ── 定时自动同步 ──
+
+	setupAutoSync(): void {
+		if (this.syncTimer !== null) {
+			window.clearInterval(this.syncTimer);
+			this.syncTimer = null;
+		}
+
+		if (!this.settings.autoSync) return;
+
+		const ms = this.settings.syncInterval * 60 * 1000;
+		this.syncTimer = window.setInterval(() => {
+			this.startSync(true);
+		}, ms);
 	}
 
-	onClose() {
-		const {contentEl} = this;
-		contentEl.empty();
+	// ── 退出拦截：快速合并提交 ──
+
+	private onBeforeUnload(): void {
+		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
+		if (!accessKey || !secretKey || !endpoint || !bucketName) return;
+
+		// 同步执行：仅上传近 5 分钟内修改的文件
+		const manager = new S3TransferManager(this.app.vault, this.settings);
+		// 使用 .then() 不阻塞关闭流程，但浏览器会等待微任务
+		manager.quickSync(this.deviceId, 5 * 60 * 1000).catch(() => {});
+	}
+
+	// ── 设备 ID ──
+
+	private async getDeviceId(): Promise<string> {
+		const stored = this.app.loadLocalStorage("s3-sync-device-id");
+		if (stored) return stored;
+
+		const id = generateDeviceId();
+		this.app.saveLocalStorage("s3-sync-device-id", id);
+		return id;
+	}
+
+	// ── 同步入口 ──
+
+	private async startSync(silent = false): Promise<void> {
+		if (this.syncing) {
+			if (!silent) new Notice("同步正在进行中，请稍候…");
+			return;
+		}
+
+		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
+		if (!accessKey || !secretKey || !endpoint || !bucketName) {
+			if (!silent) new Notice("请先在设置中填写完整的 S3 配置");
+			return;
+		}
+
+		this.syncing = true;
+		this.updateStatusBar("scanning");
+
+		if (!silent) new Notice("S3 同步开始…");
+
+		try {
+			const manager = new S3TransferManager(this.app.vault, this.settings);
+			const result = await manager.fullSync(this.deviceId, (done, total) => {
+				// 根据进度判断当前阶段
+				const uploadCount = Math.min(done, result.uploaded + result.failed.length);
+				if (uploadCount < total) {
+					this.updateStatusBar("uploading", {done, total});
+				} else {
+					this.updateStatusBar("downloading", {done, total});
+				}
+			});
+
+			this.updateStatusBar("done");
+
+			if (!silent) {
+				const lines: string[] = [];
+				if (result.uploaded > 0) lines.push(`上传 ${result.uploaded} 个文件`);
+				if (result.downloaded > 0) lines.push(`下载 ${result.downloaded} 个文件`);
+				if (result.failed.length > 0) lines.push(`${result.failed.length} 个文件失败`);
+				if (result.conflicts.length > 0) lines.push(`${result.conflicts.length} 个冲突待处理`);
+
+				if (lines.length === 0) {
+					new Notice("同步完成，所有文件已是最新");
+				} else {
+					new Notice(`同步完成：${lines.join("，")}`);
+				}
+			}
+
+			if (result.failed.length > 0) {
+				console.warn("[S3 Sync] 失败文件：", result.failed);
+			}
+		} catch (err: unknown) {
+			const msg = err instanceof Error ? err.message : String(err);
+			if (!silent) new Notice(`同步出错：${msg}`, 8000);
+			this.updateStatusBar("idle");
+		} finally {
+			this.syncing = false;
+		}
 	}
 }
