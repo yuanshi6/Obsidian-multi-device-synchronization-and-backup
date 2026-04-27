@@ -1,7 +1,7 @@
 import {DeleteObjectCommand, GetObjectCommand, ListObjectsV2Command, ListObjectsV2CommandOutput, PutObjectCommand, S3Client} from "@aws-sdk/client-s3";
 import {Notice, Vault} from "obsidian";
 import {S3BackupSettings} from "./settings";
-import {computeSyncDelta, FileEntry, FileScanner, normalizeSyncPath, SyncDelta, SyncManifest} from "./scanner";
+import {computeSyncDelta, DeletedEntry, FileEntry, FileScanner, normalizeSyncPath, SyncDelta, SyncManifest} from "./scanner";
 
 const MAX_RETRIES = 3;
 const RETRY_DELAY_MS = 2000;
@@ -31,7 +31,9 @@ function cleanS3Key(path: string): string {
 
 function emptyManifest(): SyncManifest {
 	return {
+		version: "2.0",
 		deviceId: "",
+		deviceName: "",
 		lastSyncTime: 0,
 		files: {},
 		deleted: {},
@@ -53,6 +55,8 @@ export class S3TransferManager {
 	private bucket: string;
 	private vault: Vault;
 	private scanner: FileScanner;
+	private deviceId: string;
+	private deviceName: string;
 	public isSyncing: boolean = false;
 
 	constructor(vault: Vault, settings: S3BackupSettings) {
@@ -68,6 +72,8 @@ export class S3TransferManager {
 		});
 		this.bucket = settings.bucketName;
 		this.vault = vault;
+		this.deviceId = settings.deviceId;
+		this.deviceName = settings.deviceName;
 		this.scanner = new FileScanner(vault.adapter, settings);
 	}
 
@@ -109,11 +115,37 @@ export class S3TransferManager {
 				Key: "manifest.json",
 			}));
 			const body = await resp.Body!.transformToString("utf-8");
-			const parsed = JSON.parse(body) as SyncManifest;
-			// 兼容旧版 manifest（无 deleted 字段）
+			const parsed = JSON.parse(body);
+
+			// V1 → V2 兼容迁移
+			if (!parsed.version) {
+				console.log("[S3 Sync] 检测到 V1 manifest，自动升级为 V2");
+				parsed.version = "2.0";
+				parsed.deviceName = parsed.deviceName ?? "";
+				// V1 deleted 是 Record<string, number>，V2 是 Record<string, DeletedEntry>
+				if (parsed.deleted) {
+					const migrated: Record<string, DeletedEntry> = {};
+					for (const [path, val] of Object.entries(parsed.deleted)) {
+						if (typeof val === "number") {
+							migrated[path] = {mtime: val, deletedBy: ""};
+						} else {
+							migrated[path] = val as DeletedEntry;
+						}
+					}
+					parsed.deleted = migrated;
+				}
+				// V1 files 没有 hash/lastModifiedBy，补默认值
+				if (parsed.files) {
+					for (const entry of Object.values(parsed.files) as Array<Record<string, unknown>>) {
+						if (!entry.hash) entry.hash = `${entry.size}-${Math.floor(entry.mtime as number)}`;
+						if (!entry.lastModifiedBy) entry.lastModifiedBy = "";
+					}
+				}
+			}
+
 			if (!parsed.deleted) parsed.deleted = {};
 			console.log("[S3 Sync] 云端 manifest 已获取，文件数：", Object.keys(parsed.files).length, "删除记录：", Object.keys(parsed.deleted).length);
-			return parsed;
+			return parsed as SyncManifest;
 		} catch (err: unknown) {
 			const errName = (err as { name?: string })?.name ?? "";
 			const httpStatus = (err as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
@@ -174,13 +206,13 @@ export class S3TransferManager {
 			return 0;
 		}
 
-		console.log("[S3 Sync] ☁️ 当前云端文件列表总数:", allCloudKeys.length, allCloudKeys);
+		console.log("[S3 Sync] 当前云端文件列表总数:", allCloudKeys.length, allCloudKeys);
 
 		if (orphanKeys.length === 0) {
-			console.log("[S3 Sync] ☁️ 云端无孤儿文件，桶环境干净");
+			console.log("[S3 Sync] 云端无孤儿文件，桶环境干净");
 			return 0;
 		}
-		console.warn("[S3 Sync] ⚠️ 发现云端未同步(孤儿)文件:", orphanKeys);
+		console.warn("[S3 Sync] 发现云端未同步(孤儿)文件:", orphanKeys);
 
 		const deletedKeys: string[] = [];
 		for (const key of orphanKeys) {
@@ -195,7 +227,7 @@ export class S3TransferManager {
 				console.warn("[S3 Sync] 清理孤儿文件失败：", key, msg);
 			}
 		}
-		console.log("[S3 Sync] 🗑️ 成功清理废弃测试文件:", deletedKeys);
+		console.log("[S3 Sync] 成功清理孤儿文件:", deletedKeys);
 
 		return deletedKeys.length;
 	}
@@ -282,6 +314,7 @@ export class S3TransferManager {
 		delta: SyncDelta,
 		localFiles: Record<string, FileEntry>,
 		deviceId: string,
+		deviceName: string,
 		cloudManifest: SyncManifest,
 		onProgress?: (done: number, total: number) => void,
 	): Promise<SyncResult> {
@@ -367,19 +400,19 @@ export class S3TransferManager {
 			const now = Date.now();
 
 			// 合并删除记录：保留云端已有的 + 本地删除的 + 清理过期记录
-			const mergedDeleted: Record<string, number> = {};
-			for (const [path, delTime] of Object.entries(cloudManifest.deleted ?? {})) {
-				if (now - delTime < DELETED_EXPIRY_MS) {
-					mergedDeleted[path] = delTime;
+			const mergedDeleted: Record<string, DeletedEntry> = {};
+			for (const [path, entry] of Object.entries(cloudManifest.deleted ?? {})) {
+				if (now - entry.mtime < DELETED_EXPIRY_MS) {
+					mergedDeleted[path] = entry;
 				}
 			}
 			// 本地删除的文件也加入 deleted 记录
 			for (const path of localDeletePaths) {
-				mergedDeleted[path] = now;
+				mergedDeleted[path] = {mtime: now, deletedBy: deviceId};
 			}
-			// 本地删除的文件（deleteQueue 中的，即本地已删云端还在的）也加入
+			// 云端删除的文件也加入
 			for (const path of deletePaths) {
-				mergedDeleted[path] = now;
+				mergedDeleted[path] = {mtime: now, deletedBy: deviceId};
 			}
 			// 上传/下载成功的文件从 deleted 中移除
 			for (const path of uploadPaths) {
@@ -390,7 +423,9 @@ export class S3TransferManager {
 			}
 
 			const newManifest: SyncManifest = {
+				version: "2.0",
 				deviceId,
+				deviceName,
 				lastSyncTime: now,
 				files: latestFiles,
 				deleted: mergedDeleted,
@@ -408,31 +443,31 @@ export class S3TransferManager {
 
 	// ── 一键同步入口 ──
 
-	async fullSync(deviceId: string, localLastSyncTime: number, onProgress?: (done: number, total: number) => void): Promise<SyncResult> {
+	async fullSync(deviceId: string, localLastSyncTime: number, onProgress?: (done: number, total: number) => void, localTombstones: Record<string, DeletedEntry> = {}): Promise<SyncResult> {
 		if (this.isSyncing) {
-			console.log("[S3 Sync] ⚠️ 当前已有同步任务正在进行，跳过本次触发");
+			console.log("[S3 Sync] 当前已有同步任务正在进行，跳过本次触发");
 			return {uploaded: 0, downloaded: 0, deleted: 0, localDeleted: 0, orphanCleaned: 0, failed: [], conflicts: []};
 		}
 		this.isSyncing = true;
 		try {
-			console.log("[S3 Sync] 🚀 开始执行增量同步...");
+			console.log("[S3 Sync] 开始执行增量同步...");
 			const localFiles = await this.scanner.scanAll();
-			console.log("[S3 Sync] 📂 本地文件扫描完成，文件数：", Object.keys(localFiles).length);
+			console.log("[S3 Sync] 本地文件扫描完成，文件数：", Object.keys(localFiles).length);
 
 			const cloudManifest = await this.fetchCloudManifest();
 			const orphanCleaned = await this.cleanOrphanFiles(cloudManifest);
-			const delta = computeSyncDelta(localFiles, cloudManifest, deviceId, localLastSyncTime);
+			const delta = computeSyncDelta(localFiles, cloudManifest, deviceId, localLastSyncTime, localTombstones);
 
-			console.log("[S3 Sync] ⬆️ 待上传队列:", delta.uploadQueue);
-			console.log("[S3 Sync] ⬇️ 待下载队列:", delta.downloadQueue);
-			console.log("[S3 Sync] 🗑️ 云端删除队列:", delta.deleteQueue);
-			console.log("[S3 Sync] 🗑️ 本地删除队列:", delta.localDeleteQueue);
-			console.log("[S3 Sync] ⚠️ 冲突队列:", delta.conflictQueue);
+			console.log("[S3 Sync] 待上传队列:", delta.uploadQueue);
+			console.log("[S3 Sync] 待下载队列:", delta.downloadQueue);
+			console.log("[S3 Sync] 云端删除队列:", delta.deleteQueue);
+			console.log("[S3 Sync] 本地删除队列:", delta.localDeleteQueue);
+			console.log("[S3 Sync] 冲突队列:", delta.conflictQueue);
 
-			const syncResult = await this.processQueues(delta, localFiles, deviceId, cloudManifest, onProgress);
+			const syncResult = await this.processQueues(delta, localFiles, deviceId, this.deviceName, cloudManifest, onProgress);
 			syncResult.orphanCleaned = orphanCleaned;
 
-			console.log("[S3 Sync] ✅ 同步完成，已生成最新 manifest.json");
+			console.log("[S3 Sync] 同步完成，已生成最新 manifest.json");
 			return syncResult;
 		} finally {
 			this.isSyncing = false;
@@ -441,9 +476,9 @@ export class S3TransferManager {
 
 	// ── 快速合并提交 ──
 
-	async quickSync(deviceId: string, localLastSyncTime: number, recentMs: number): Promise<SyncResult> {
+	async quickSync(deviceId: string, localLastSyncTime: number, recentMs: number, localTombstones: Record<string, DeletedEntry> = {}): Promise<SyncResult> {
 		if (this.isSyncing) {
-			console.log("[S3 Sync] ⚠️ 当前已有同步任务正在进行，跳过本次触发");
+			console.log("[S3 Sync] 当前已有同步任务正在进行，跳过本次触发");
 			return {uploaded: 0, downloaded: 0, deleted: 0, localDeleted: 0, orphanCleaned: 0, failed: [], conflicts: []};
 		}
 		this.isSyncing = true;
@@ -452,7 +487,7 @@ export class S3TransferManager {
 			const localFiles = await this.scanner.scanAll();
 			const cloudManifest = await this.fetchCloudManifest();
 
-			const delta = computeSyncDelta(localFiles, cloudManifest, deviceId, localLastSyncTime);
+			const delta = computeSyncDelta(localFiles, cloudManifest, deviceId, localLastSyncTime, localTombstones);
 
 			const cutoff = Date.now() - recentMs;
 			const cloudFiles = cloudManifest?.files ?? {};
@@ -472,7 +507,7 @@ export class S3TransferManager {
 
 			console.log("[S3 Sync] 近期变更：上传", recentDelta.uploadQueue.length, "下载", recentDelta.downloadQueue.length, "云端删除", recentDelta.deleteQueue.length, "本地删除", recentDelta.localDeleteQueue.length, "冲突", recentDelta.conflictQueue.length);
 
-			return this.processQueues(recentDelta, localFiles, deviceId, cloudManifest);
+			return this.processQueues(recentDelta, localFiles, deviceId, this.deviceName, cloudManifest);
 		} finally {
 			this.isSyncing = false;
 		}

@@ -1,5 +1,6 @@
-import {Notice, Plugin} from "obsidian";
+import {Notice, Plugin, TAbstractFile, TFile} from "obsidian";
 import {DEFAULT_SETTINGS, S3BackupSettings, S3SyncSettingTab} from "./settings";
+import {DeletedEntry} from "./scanner";
 import {S3TransferManager} from "./transfer";
 
 function generateDeviceId(): string {
@@ -14,10 +15,10 @@ function generateDeviceId(): string {
 type SyncPhase = "idle" | "scanning" | "uploading" | "downloading" | "deleting" | "done";
 
 const DEBOUNCE_MS = 5000;
+const TOMBSTONE_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
 
 export default class S3SyncPlugin extends Plugin {
 	settings: S3BackupSettings;
-	private deviceId = "";
 	private syncing = false;
 	private syncTimer: number | null = null;
 	private debounceTimer: number | null = null;
@@ -25,10 +26,19 @@ export default class S3SyncPlugin extends Plugin {
 	private statusBarItem: HTMLElement | null = null;
 	private beforeUnloadHandler: ((evt: BeforeUnloadEvent) => void) | null = null;
 	private visibilityHandler: (() => void) | null = null;
+	private localTombstones: Record<string, DeletedEntry> = {};
 
 	async onload() {
 		await this.loadSettings();
-		this.deviceId = await this.getDeviceId();
+
+		// 确保 deviceId 存在
+		if (!this.settings.deviceId) {
+			this.settings.deviceId = generateDeviceId();
+			await this.saveSettings();
+		}
+
+		// 加载本地墓碑记录
+		this.localTombstones = await this.loadTombstones();
 
 		// 读取本地上次同步时间戳
 		const storedTime = this.app.loadLocalStorage("s3-sync-last-sync-time");
@@ -59,8 +69,11 @@ export default class S3SyncPlugin extends Plugin {
 		// 事件防抖同步：监听文件变更，5秒无新操作后自动同步
 		this.registerEvent(this.app.vault.on("modify", () => this.scheduleDebouncedSync()));
 		this.registerEvent(this.app.vault.on("create", () => this.scheduleDebouncedSync()));
-		this.registerEvent(this.app.vault.on("delete", () => this.scheduleDebouncedSync()));
-		this.registerEvent(this.app.vault.on("rename", () => this.scheduleDebouncedSync()));
+		this.registerEvent(this.app.vault.on("delete", (file) => this.onFileDelete(file)));
+		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
+			this.onFileDeleteByPath(oldPath);
+			this.scheduleDebouncedSync();
+		}));
 
 		// 电脑端退出拦截
 		this.beforeUnloadHandler = (evt: BeforeUnloadEvent) => {
@@ -110,6 +123,65 @@ export default class S3SyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
+	// ── 本地墓碑持久化 ──
+
+	private async loadTombstones(): Promise<Record<string, DeletedEntry>> {
+		const raw = this.app.loadLocalStorage("s3-sync-tombstones");
+		if (!raw) return {};
+		try {
+			return JSON.parse(raw) as Record<string, DeletedEntry>;
+		} catch {
+			return {};
+		}
+	}
+
+	private async saveTombstones(): Promise<void> {
+		this.app.saveLocalStorage("s3-sync-tombstones", JSON.stringify(this.localTombstones));
+	}
+
+	private pruneTombstones(): void {
+		const now = Date.now();
+		for (const [path, entry] of Object.entries(this.localTombstones)) {
+			if (now - entry.mtime > TOMBSTONE_EXPIRY_MS) {
+				delete this.localTombstones[path];
+			}
+		}
+	}
+
+	// ── 文件删除拦截 → 记录墓碑 ──
+
+	private isPathExcluded(path: string): boolean {
+		const patterns = this.settings.excludePatterns;
+		if (!patterns) return false;
+		const parts = patterns.split(",").map(p => p.trim()).filter(p => p.length > 0);
+		for (const pattern of parts) {
+			const escaped = pattern
+				.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+				.replace(/\*/g, ".*")
+				.replace(/\?/g, ".");
+			const regex = new RegExp(`(?:^|/)${escaped}(?:/|$)`);
+			if (regex.test(path)) return true;
+		}
+		return false;
+	}
+
+	private onFileDelete(file: TAbstractFile): void {
+		if (!(file instanceof TFile)) return;
+		this.onFileDeleteByPath(file.path);
+		this.scheduleDebouncedSync();
+	}
+
+	private onFileDeleteByPath(path: string): void {
+		// 只记录 .md 文件且不在排除目录中
+		if (!path.endsWith(".md")) return;
+		if (this.isPathExcluded(path)) return;
+
+		const now = Date.now();
+		this.localTombstones[path] = {mtime: now, deletedBy: this.settings.deviceId};
+		console.log("[S3 Sync] 记录墓碑：", path, "时间：", now);
+		this.saveTombstones();
+	}
+
 	// ── 状态栏 ──
 
 	private updateStatusBar(phase: SyncPhase, progress?: { done: number; total: number }): void {
@@ -151,10 +223,10 @@ export default class S3SyncPlugin extends Plugin {
 		const ms = this.settings.syncInterval * 60 * 1000;
 		this.syncTimer = window.setInterval(() => {
 			if (!navigator.onLine) {
-				console.log("[S3 Sync] 📴 当前离线，跳过定时同步");
+				console.log("[S3 Sync] 当前离线，跳过定时同步");
 				return;
 			}
-			console.log(`[S3 Sync] ⏰ 触发 ${this.settings.syncInterval} 分钟定时同步...`);
+			console.log(`[S3 Sync] 触发 ${this.settings.syncInterval} 分钟定时同步...`);
 			this.startSync(true);
 		}, ms);
 	}
@@ -188,13 +260,14 @@ export default class S3SyncPlugin extends Plugin {
 
 		try {
 			const manager = new S3TransferManager(this.app.vault, this.settings);
-			manager.quickSync(this.deviceId, this.localLastSyncTime, 5 * 60 * 1000)
+			manager.quickSync(this.settings.deviceId, this.localLastSyncTime, 5 * 60 * 1000, this.localTombstones)
 				.then((syncResult) => {
 					console.log("[S3 Sync] 退出同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
 					if (syncResult.uploaded > 0 || syncResult.downloaded > 0 || syncResult.deleted > 0) {
 						this.localLastSyncTime = Date.now();
 						this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
 					}
+					this.clearTombstonesAfterSync(syncResult);
 				})
 				.catch((err: unknown) => {
 					console.error("[S3 Sync] 退出同步失败：", err);
@@ -220,13 +293,14 @@ export default class S3SyncPlugin extends Plugin {
 
 		try {
 			const manager = new S3TransferManager(this.app.vault, this.settings);
-			manager.quickSync(this.deviceId, this.localLastSyncTime, 5 * 60 * 1000)
+			manager.quickSync(this.settings.deviceId, this.localLastSyncTime, 5 * 60 * 1000, this.localTombstones)
 				.then((syncResult) => {
 					console.log("[S3 Sync] 挂起同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
 					if (syncResult.uploaded > 0 || syncResult.downloaded > 0 || syncResult.deleted > 0) {
 						this.localLastSyncTime = Date.now();
 						this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
 					}
+					this.clearTombstonesAfterSync(syncResult);
 				})
 				.catch((err: unknown) => {
 					console.error("[S3 Sync] 挂起同步失败：", err);
@@ -240,15 +314,12 @@ export default class S3SyncPlugin extends Plugin {
 		}
 	}
 
-	// ── 设备 ID ──
+	// ── 同步后清理墓碑 ──
 
-	async getDeviceId(): Promise<string> {
-		const stored = this.app.loadLocalStorage("s3-sync-device-id");
-		if (stored) return stored;
-
-		const id = generateDeviceId();
-		this.app.saveLocalStorage("s3-sync-device-id", id);
-		return id;
+	private async clearTombstonesAfterSync(result: { uploaded: number; downloaded: number; deleted: number; localDeleted: number; failed: Array<{ path: string }>; conflicts: string[] }): Promise<void> {
+		// 同步成功后，清理已处理的墓碑
+		this.pruneTombstones();
+		await this.saveTombstones();
 	}
 
 	// ── 同步入口 ──
@@ -272,13 +343,16 @@ export default class S3SyncPlugin extends Plugin {
 
 		try {
 			const manager = new S3TransferManager(this.app.vault, this.settings);
-			const result = await manager.fullSync(this.deviceId, this.localLastSyncTime, (done, total) => {
+			const result = await manager.fullSync(this.settings.deviceId, this.localLastSyncTime, (done, total) => {
 				this.updateStatusBar("uploading", {done, total});
-			});
+			}, this.localTombstones);
 
 			// 同步成功后更新本地上次同步时间
 			this.localLastSyncTime = Date.now();
 			this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
+
+			// 清理已处理的墓碑
+			await this.clearTombstonesAfterSync(result);
 
 			this.updateStatusBar("done");
 
@@ -287,7 +361,7 @@ export default class S3SyncPlugin extends Plugin {
 				if (result.uploaded > 0) lines.push(`上传 ${result.uploaded} 个文件`);
 				if (result.downloaded > 0) lines.push(`下载 ${result.downloaded} 个文件`);
 				if (result.deleted > 0) lines.push(`删除 ${result.deleted} 个云端文件`);
-					if (result.localDeleted > 0) lines.push(`删除 ${result.localDeleted} 个本地文件`);
+				if (result.localDeleted > 0) lines.push(`删除 ${result.localDeleted} 个本地文件`);
 				if (result.orphanCleaned > 0) lines.push(`清理 ${result.orphanCleaned} 个云端孤儿文件`);
 				if (result.failed.length > 0) lines.push(`${result.failed.length} 个文件失败`);
 				if (result.conflicts.length > 0) lines.push(`${result.conflicts.length} 个冲突待处理`);

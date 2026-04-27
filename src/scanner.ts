@@ -20,13 +20,22 @@ function isSystemFile(path: string): boolean {
 export interface FileEntry {
 	mtime: number;
 	size: number;
+	hash: string;
+	lastModifiedBy: string;
+}
+
+export interface DeletedEntry {
+	mtime: number;
+	deletedBy: string;
 }
 
 export interface SyncManifest {
+	version: string;
 	deviceId: string;
+	deviceName: string;
 	lastSyncTime: number;
 	files: Record<string, FileEntry>;
-	deleted: Record<string, number>; // 已删除文件路径 → 删除时间戳
+	deleted: Record<string, DeletedEntry>;
 }
 
 // ── Diff 输出 ──
@@ -44,9 +53,11 @@ export interface SyncDelta {
 export class FileScanner {
 	private adapter: DataAdapter;
 	private excludeRegex: RegExp | null;
+	private deviceId: string;
 
 	constructor(adapter: DataAdapter, settings: S3BackupSettings) {
 		this.adapter = adapter;
+		this.deviceId = settings.deviceId;
 		this.excludeRegex = this.buildExcludeRegex(settings.excludePatterns);
 	}
 
@@ -84,7 +95,13 @@ export class FileScanner {
 			if (this.isExcluded(filePath) || isSystemFile(filePath)) continue;
 			const stat = await this.adapter.stat(filePath);
 			if (stat && stat.mtime != null) {
-				result[normalizeSyncPath(filePath)] = {mtime: stat.mtime, size: stat.size};
+				const normalized = normalizeSyncPath(filePath);
+				result[normalized] = {
+					mtime: stat.mtime,
+					size: stat.size,
+					hash: `${stat.size}-${Math.floor(stat.mtime)}`,
+					lastModifiedBy: this.deviceId,
+				};
 			}
 		}
 
@@ -95,13 +112,17 @@ export class FileScanner {
 	}
 }
 
-// ── Diff 算法（支持双向删除同步）──
+// ── Diff 算法（LWW 四象限 + 墓碑机制）──
+// 铁律 1：绝对 LWW 时间戳仲裁 — 谁的 mtime 更晚谁赢
+// 铁律 2：无空引用删除 — 云端缺失的本地文件一律视为"本地新增"上传
+// 铁律 3：墓碑机制 — 本地删除被拦截为墓碑，墓碑时间戳与云端 mtime 竞争
 
 export function computeSyncDelta(
 	localFiles: Record<string, FileEntry>,
 	cloudManifest: SyncManifest | null,
 	currentDeviceId: string = "",
 	localLastSyncTime: number = 0,
+	localTombstones: Record<string, DeletedEntry> = {},
 ): SyncDelta {
 	const uploadQueue: string[] = [];
 	const downloadQueue: string[] = [];
@@ -110,54 +131,85 @@ export function computeSyncDelta(
 	const conflictQueue: string[] = [];
 
 	const cloudFiles = cloudManifest?.files ?? {};
-	const cloudLastSyncTime = cloudManifest?.lastSyncTime ?? 0;
-	const manifestDeviceId = cloudManifest?.deviceId ?? "";
 	const cloudDeleted = cloudManifest?.deleted ?? {};
 
+	// 收集所有涉及路径：本地文件 + 云端文件 + 本地墓碑 + 云端墓碑
 	const allPaths = new Set<string>([
 		...Object.keys(localFiles),
 		...Object.keys(cloudFiles),
+		...Object.keys(localTombstones),
+		...Object.keys(cloudDeleted),
 	]);
 
 	for (const path of allPaths) {
 		const local = localFiles[path];
 		const cloud = cloudFiles[path];
+		const localTomb = localTombstones[path];
+		const cloudTomb = cloudDeleted[path];
+
+		// ── 第一象限：墓碑检查（优先级最高）──
+
+		if (localTomb && cloudTomb) {
+			// 两端都有墓碑 → 无需操作，保留较新的墓碑即可
+			// 墓碑合并由 processQueues 在构建新 manifest 时处理
+			continue;
+		}
+
+		if (localTomb && !cloudTomb) {
+			// 本地已删除，云端无墓碑
+			if (cloud) {
+				// 云端文件仍存在 → LWW：本地墓碑时间 vs 云端 mtime
+				if (localTomb.mtime >= cloud.mtime) {
+					// 墓碑更新或同时 → 删云端
+					deleteQueue.push(path);
+				} else {
+					// 云端更新 → 下载到本地（墓碑被覆盖）
+					downloadQueue.push(path);
+				}
+			}
+			// 云端也不存在 → 两端都已删除，无需操作
+			continue;
+		}
+
+		if (!localTomb && cloudTomb) {
+			// 云端有墓碑，本地无墓碑
+			if (local) {
+				// 本地文件仍存在 → LWW：云端墓碑时间 vs 本地 mtime
+				if (cloudTomb.mtime >= local.mtime) {
+					// 墓碑更新或同时 → 删本地
+					localDeleteQueue.push(path);
+				} else {
+					// 本地更新 → 上传（覆盖墓碑）
+					uploadQueue.push(path);
+				}
+			}
+			// 本地也不存在 → 两端都已删除，无需操作
+			continue;
+		}
+
+		// ── 第二象限：仅本地存在（无墓碑）──
 
 		if (local && !cloud) {
-			// 仅本地存在
-			if (cloudDeleted[path]) {
-				// 云端已标记删除 → 删本地
-				localDeleteQueue.push(path);
-			} else if (localLastSyncTime > 0 && local.mtime <= localLastSyncTime) {
-				// 本地上次同步后未修改，但云端已删除 → 删本地
-				localDeleteQueue.push(path);
-			} else {
-				// 本地新增 → 上传
-				uploadQueue.push(path);
-			}
-		} else if (!local && cloud) {
-			// 仅云端存在
-			if (currentDeviceId && manifestDeviceId && currentDeviceId === manifestDeviceId) {
-				// manifest 是本机上次上传的 → 本地已删除，从云端删除
-				deleteQueue.push(path);
-			} else if (cloudLastSyncTime > 0 && cloud.mtime <= cloudLastSyncTime) {
-				// 云端 mtime 早于上次同步 → 本地已删除
-				deleteQueue.push(path);
-			} else {
-				// 其他设备新增 → 下载到本地
-				downloadQueue.push(path);
-			}
-		} else if (local && cloud) {
-			// 两端都存在，比较 mtime
+			// 铁律 2：云端缺失 = 本地新增 → 上传
+			uploadQueue.push(path);
+			continue;
+		}
+
+		// ── 第三象限：仅云端存在（无墓碑）──
+
+		if (!local && cloud) {
+			// 铁律 2 对称：本地缺失 = 云端新增 → 下载
+			downloadQueue.push(path);
+			continue;
+		}
+
+		// ── 第四象限：两端都存在 → LWW mtime 比较 ──
+
+		if (local && cloud) {
 			if (local.mtime === cloud.mtime) continue;
 
-			const localChanged = local.mtime > localLastSyncTime;
-			const cloudChanged = cloud.mtime > cloudLastSyncTime;
-
-			if (localChanged && cloudChanged) {
-				// 两端均在同步后修改 → 冲突
-				conflictQueue.push(path);
-			} else if (localChanged) {
+			// 铁律 1：绝对 LWW — mtime 更晚者胜
+			if (local.mtime > cloud.mtime) {
 				uploadQueue.push(path);
 			} else {
 				downloadQueue.push(path);

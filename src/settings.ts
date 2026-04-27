@@ -11,6 +11,8 @@ export interface S3BackupSettings {
 	autoSync: boolean;
 	syncInterval: number;
 	excludePatterns: string;
+	deviceId: string;
+	deviceName: string;
 }
 
 export const DEFAULT_SETTINGS: S3BackupSettings = {
@@ -22,6 +24,8 @@ export const DEFAULT_SETTINGS: S3BackupSettings = {
 	autoSync: false,
 	syncInterval: 30,
 	excludePatterns: ".obsidian,.trash",
+	deviceId: "",
+	deviceName: "未命名设备",
 };
 
 export class S3SyncSettingTab extends PluginSettingTab {
@@ -109,6 +113,31 @@ export class S3SyncSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
+		// ── 设备身份 ──
+		containerEl.createEl("h3", {text: "设备身份"});
+
+		new Setting(containerEl)
+			.setName("设备名称")
+			.setDesc("用于在多设备同步时标识本设备，建议使用有辨识度的名称（如'公司电脑'、'手机'）")
+			.addText(text => text
+				.setPlaceholder("未命名设备")
+				.setValue(this.plugin.settings.deviceName)
+				.onChange(async (value) => {
+					this.plugin.settings.deviceName = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName("设备 ID")
+			.setDesc(`自动生成的唯一标识符：${this.plugin.settings.deviceId || "尚未生成"}`)
+			.addExtraButton(btn => btn
+				.setIcon("copy")
+				.setTooltip("复制设备 ID")
+				.onClick(() => {
+					navigator.clipboard.writeText(this.plugin.settings.deviceId);
+					new Notice("设备 ID 已复制");
+				}));
+
 		// ── 同步策略 ──
 		containerEl.createEl("h3", {text: "同步策略"});
 
@@ -166,8 +195,8 @@ export class S3SyncSettingTab extends PluginSettingTab {
 						try {
 							const {S3TransferManager} = await import("./transfer");
 							const manager = new S3TransferManager(this.app.vault, this.plugin.settings);
-							const deviceId = await this.plugin.getDeviceId();
-							const result = await manager.fullSync(deviceId, 0);
+							
+							const result = await manager.fullSync(this.plugin.settings.deviceId, 0);
 
 							const lines: string[] = [];
 							if (result.uploaded > 0) lines.push(`上传 ${result.uploaded}`);
