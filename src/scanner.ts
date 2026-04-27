@@ -15,13 +15,13 @@ function isSystemFile(path: string): boolean {
 	return SYSTEM_FILE_NAMES.has(fileName);
 }
 
-// ── Manifest 类型定义 ──
+// ── 观察者模式：FileState ──
 
-export interface FileEntry {
-	mtime: number;
-	size: number;
-	hash: string;
-	lastModifiedBy: string;
+export interface FileState {
+	lastPenDropTime: number; // 观察者记录的用户真实落笔修改时间
+	isUploaded: boolean;     // 脏读标记：是否已成功同步至云端
+	hash: string;            // 文件内容校验哈希
+	lastModifiedBy: string;  // 设备 ID
 }
 
 export interface DeletedEntry {
@@ -34,7 +34,7 @@ export interface SyncManifest {
 	deviceId: string;
 	deviceName: string;
 	lastSyncTime: number;
-	files: Record<string, FileEntry>;
+	files: Record<string, FileState>;
 	deleted: Record<string, DeletedEntry>;
 }
 
@@ -46,6 +46,8 @@ export interface SyncDelta {
 	deleteQueue: string[];       // 删除云端文件（本地已删除）
 	localDeleteQueue: string[];  // 删除本地文件（云端已删除）
 	conflictQueue: string[];
+	// 任务四：哈希缝合 — 同名同 Hash 文件无缝编入账本
+	hashStitched: string[];     // 无需传输，直接编入本地账本的路径
 }
 
 // ── 文件扫描器 ──
@@ -82,13 +84,13 @@ export class FileScanner {
 		return this.excludeRegex.test(path);
 	}
 
-	async scanAll(): Promise<Record<string, FileEntry>> {
-		const result: Record<string, FileEntry> = {};
+	async scanAll(): Promise<Record<string, FileState>> {
+		const result: Record<string, FileState> = {};
 		await this.walk("", result);
 		return result;
 	}
 
-	private async walk(dir: string, result: Record<string, FileEntry>): Promise<void> {
+	private async walk(dir: string, result: Record<string, FileState>): Promise<void> {
 		const {files, folders} = await this.adapter.list(dir);
 
 		for (const filePath of files) {
@@ -97,8 +99,8 @@ export class FileScanner {
 			if (stat && stat.mtime != null) {
 				const normalized = normalizeSyncPath(filePath);
 				result[normalized] = {
-					mtime: stat.mtime,
-					size: stat.size,
+					lastPenDropTime: stat.mtime,
+					isUploaded: false,
 					hash: `${stat.size}-${Math.floor(stat.mtime)}`,
 					lastModifiedBy: this.deviceId,
 				};
@@ -112,28 +114,28 @@ export class FileScanner {
 	}
 }
 
-// ── Diff 算法（LWW 四象限 + 墓碑机制）──
-// 铁律 1：绝对 LWW 时间戳仲裁 — 谁的 mtime 更晚谁赢
-// 铁律 2：无空引用删除 — 云端缺失的本地文件一律视为"本地新增"上传
-// 铁律 3：墓碑机制 — 本地删除被拦截为墓碑，墓碑时间戳与云端 mtime 竞争
+// ══════════════════════════════════════════════════════════
+// Diff 算法（观察者模式 + 墓碑 + 哈希缝合安全网）
+// ══════════════════════════════════════════════════════════
 
 export function computeSyncDelta(
-	localFiles: Record<string, FileEntry>,
+	localFiles: Record<string, FileState>,
 	cloudManifest: SyncManifest | null,
 	currentDeviceId: string = "",
-	localLastSyncTime: number = 0,
 	localTombstones: Record<string, DeletedEntry> = {},
+	localLedger: Record<string, FileState> = {},
 ): SyncDelta {
 	const uploadQueue: string[] = [];
 	const downloadQueue: string[] = [];
 	const deleteQueue: string[] = [];
 	const localDeleteQueue: string[] = [];
 	const conflictQueue: string[] = [];
+	const hashStitched: string[] = [];
 
 	const cloudFiles = cloudManifest?.files ?? {};
 	const cloudDeleted = cloudManifest?.deleted ?? {};
 
-	// 收集所有涉及路径：本地文件 + 云端文件 + 本地墓碑 + 云端墓碑
+	// 收集所有涉及路径
 	const allPaths = new Set<string>([
 		...Object.keys(localFiles),
 		...Object.keys(cloudFiles),
@@ -146,70 +148,72 @@ export function computeSyncDelta(
 		const cloud = cloudFiles[path];
 		const localTomb = localTombstones[path];
 		const cloudTomb = cloudDeleted[path];
+		const ledgerEntry = localLedger[path];
 
-		// ── 第一象限：墓碑检查（优先级最高）──
+		// ── 墓碑检查（优先级最高）──
 
 		if (localTomb && cloudTomb) {
-			// 两端都有墓碑 → 无需操作，保留较新的墓碑即可
-			// 墓碑合并由 processQueues 在构建新 manifest 时处理
 			continue;
 		}
 
 		if (localTomb && !cloudTomb) {
-			// 本地已删除，云端无墓碑
 			if (cloud) {
-				// 云端文件仍存在 → LWW：本地墓碑时间 vs 云端 mtime
-				if (localTomb.mtime >= cloud.mtime) {
-					// 墓碑更新或同时 → 删云端
+				if (localTomb.mtime >= cloud.lastPenDropTime) {
 					deleteQueue.push(path);
 				} else {
-					// 云端更新 → 下载到本地（墓碑被覆盖）
 					downloadQueue.push(path);
 				}
 			}
-			// 云端也不存在 → 两端都已删除，无需操作
 			continue;
 		}
 
 		if (!localTomb && cloudTomb) {
-			// 云端有墓碑，本地无墓碑
 			if (local) {
-				// 本地文件仍存在 → LWW：云端墓碑时间 vs 本地 mtime
-				if (cloudTomb.mtime >= local.mtime) {
-					// 墓碑更新或同时 → 删本地
+				if (cloudTomb.mtime >= local.lastPenDropTime) {
 					localDeleteQueue.push(path);
 				} else {
-					// 本地更新 → 上传（覆盖墓碑）
 					uploadQueue.push(path);
 				}
 			}
-			// 本地也不存在 → 两端都已删除，无需操作
 			continue;
 		}
 
-		// ── 第二象限：仅本地存在（无墓碑）──
+		// ── 无墓碑：观察者判定 ──
 
 		if (local && !cloud) {
-			// 铁律 2：云端缺失 = 本地新增 → 上传
-			uploadQueue.push(path);
+			// 仅本地存在
+			if (!local.isUploaded) {
+				uploadQueue.push(path);
+			}
 			continue;
 		}
 
-		// ── 第三象限：仅云端存在（无墓碑）──
-
 		if (!local && cloud) {
-			// 铁律 2 对称：本地缺失 = 云端新增 → 下载
+			// 仅云端存在 → 下载
 			downloadQueue.push(path);
 			continue;
 		}
 
-		// ── 第四象限：两端都存在 → LWW mtime 比较 ──
-
 		if (local && cloud) {
-			if (local.mtime === cloud.mtime) continue;
+			// ══════════════════════════════════════════════════
+			// 任务四：哈希缝合安全网 (Hash Fallback)
+			// ══════════════════════════════════════════════════
+			// 场景：冷启动/换手机，本地账本为空，但本地和云端都有同名文件
+			// 如果 Hash 一致 → 无需传输，直接编入账本
+			if (!ledgerEntry && local.hash && cloud.hash && local.hash === cloud.hash) {
+				hashStitched.push(path);
+				continue;
+			}
 
-			// 铁律 1：绝对 LWW — mtime 更晚者胜
-			if (local.mtime > cloud.mtime) {
+			// 正常观察者判定
+			if (local.lastPenDropTime === cloud.lastPenDropTime) {
+				if (!local.isUploaded) {
+					uploadQueue.push(path);
+				}
+				continue;
+			}
+
+			if (local.lastPenDropTime > cloud.lastPenDropTime) {
 				uploadQueue.push(path);
 			} else {
 				downloadQueue.push(path);
@@ -217,5 +221,5 @@ export function computeSyncDelta(
 		}
 	}
 
-	return {uploadQueue, downloadQueue, deleteQueue, localDeleteQueue, conflictQueue};
+	return {uploadQueue, downloadQueue, deleteQueue, localDeleteQueue, conflictQueue, hashStitched};
 }

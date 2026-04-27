@@ -196,7 +196,7 @@ export class S3SyncSettingTab extends PluginSettingTab {
 							const {S3TransferManager} = await import("./transfer");
 							const manager = new S3TransferManager(this.app.vault, this.plugin.settings);
 							
-							const result = await manager.fullSync(this.plugin.settings.deviceId, 0);
+							const result = await manager.fullSync(this.plugin.settings.deviceId, 0, undefined, {}, {});
 
 							const lines: string[] = [];
 							if (result.uploaded > 0) lines.push(`上传 ${result.uploaded}`);
