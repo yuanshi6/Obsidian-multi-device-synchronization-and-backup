@@ -1,22 +1,19 @@
-# vscode
-.vscode 
+# Dependencies
+node_modules/
 
-# Intellij
-*.iml
-.idea
-
-# npm
-node_modules
-
-# Don't include the compiled main.js file in the repo.
-# They should be uploaded to GitHub releases instead.
-main.js
-
-# Exclude sourcemaps
-*.map
-
-# obsidian
+# Obsidian plugin data (contains AK/SK credentials)
 data.json
 
-# Exclude macOS Finder (System Explorer) View States
+# Packaging artifacts
+dist_package/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
 .DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/

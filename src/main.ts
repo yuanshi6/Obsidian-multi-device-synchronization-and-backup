@@ -1,4 +1,4 @@
-import {Notice, Plugin, TFile, TFolder} from "obsidian";
+import {Notice, Plugin} from "obsidian";
 import {DEFAULT_SETTINGS, S3BackupSettings, S3SyncSettingTab} from "./settings";
 import {S3TransferManager} from "./transfer";
 
@@ -21,6 +21,7 @@ export default class S3SyncPlugin extends Plugin {
 	private syncing = false;
 	private syncTimer: number | null = null;
 	private debounceTimer: number | null = null;
+	private localLastSyncTime = 0;
 	private statusBarItem: HTMLElement | null = null;
 	private beforeUnloadHandler: ((evt: BeforeUnloadEvent) => void) | null = null;
 	private visibilityHandler: (() => void) | null = null;
@@ -28,6 +29,10 @@ export default class S3SyncPlugin extends Plugin {
 	async onload() {
 		await this.loadSettings();
 		this.deviceId = await this.getDeviceId();
+
+		// 读取本地上次同步时间戳
+		const storedTime = this.app.loadLocalStorage("s3-sync-last-sync-time");
+		this.localLastSyncTime = storedTime ? parseInt(storedTime, 10) : 0;
 
 		// Ribbon 图标
 		this.addRibbonIcon("refresh-cw", "S3 Sync", () => {
@@ -48,18 +53,8 @@ export default class S3SyncPlugin extends Plugin {
 		this.statusBarItem = this.addStatusBarItem();
 		this.updateStatusBar("idle");
 
-		// 定时自动同步
+		// 定时自动同步（受 autoSync 开关和 syncInterval 控制）
 		this.setupAutoSync();
-
-		// 5 分钟后台定时同步（始终运行，不受 autoSync 开关影响）
-		this.registerInterval(window.setInterval(() => {
-			if (!navigator.onLine) {
-				console.log("[S3 Sync] 📴 当前离线，跳过定时同步");
-				return;
-			}
-			console.log("[S3 Sync] ⏰ 触发 5 分钟后台定时同步检查...");
-			this.startSync(true);
-		}, 5 * 60 * 1000));
 
 		// 事件防抖同步：监听文件变更，5秒无新操作后自动同步
 		this.registerEvent(this.app.vault.on("modify", () => this.scheduleDebouncedSync()));
@@ -76,10 +71,10 @@ export default class S3SyncPlugin extends Plugin {
 		};
 		window.addEventListener("beforeunload", this.beforeUnloadHandler);
 
-		// 移动端挂起同步：App 切到后台时触发紧急同步
+		// 移动端挂起同步：App 切到后台时延迟 2 秒触发紧急同步（等待 Obsidian 保存）
 		this.visibilityHandler = () => {
 			if (document.visibilityState === "hidden") {
-				this.onAppSuspend();
+				setTimeout(() => this.onAppSuspend(), 2000);
 			}
 		};
 		document.addEventListener("visibilitychange", this.visibilityHandler);
@@ -155,6 +150,11 @@ export default class S3SyncPlugin extends Plugin {
 
 		const ms = this.settings.syncInterval * 60 * 1000;
 		this.syncTimer = window.setInterval(() => {
+			if (!navigator.onLine) {
+				console.log("[S3 Sync] 📴 当前离线，跳过定时同步");
+				return;
+			}
+			console.log(`[S3 Sync] ⏰ 触发 ${this.settings.syncInterval} 分钟定时同步...`);
 			this.startSync(true);
 		}, ms);
 	}
@@ -162,7 +162,8 @@ export default class S3SyncPlugin extends Plugin {
 	// ── 事件防抖同步 ──
 
 	private scheduleDebouncedSync(): void {
-		if (!this.settings.autoSync && !this.settings.accessKey) return;
+		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
+		if (!accessKey || !secretKey || !endpoint || !bucketName) return;
 
 		if (this.debounceTimer !== null) {
 			window.clearTimeout(this.debounceTimer);
@@ -187,9 +188,13 @@ export default class S3SyncPlugin extends Plugin {
 
 		try {
 			const manager = new S3TransferManager(this.app.vault, this.settings);
-			manager.quickSync(this.deviceId, 5 * 60 * 1000)
+			manager.quickSync(this.deviceId, this.localLastSyncTime, 5 * 60 * 1000)
 				.then((syncResult) => {
 					console.log("[S3 Sync] 退出同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
+					if (syncResult.uploaded > 0 || syncResult.downloaded > 0 || syncResult.deleted > 0) {
+						this.localLastSyncTime = Date.now();
+						this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
+					}
 				})
 				.catch((err: unknown) => {
 					console.error("[S3 Sync] 退出同步失败：", err);
@@ -215,9 +220,13 @@ export default class S3SyncPlugin extends Plugin {
 
 		try {
 			const manager = new S3TransferManager(this.app.vault, this.settings);
-			manager.quickSync(this.deviceId, 5 * 60 * 1000)
+			manager.quickSync(this.deviceId, this.localLastSyncTime, 5 * 60 * 1000)
 				.then((syncResult) => {
 					console.log("[S3 Sync] 挂起同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
+					if (syncResult.uploaded > 0 || syncResult.downloaded > 0 || syncResult.deleted > 0) {
+						this.localLastSyncTime = Date.now();
+						this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
+					}
 				})
 				.catch((err: unknown) => {
 					console.error("[S3 Sync] 挂起同步失败：", err);
@@ -263,9 +272,13 @@ export default class S3SyncPlugin extends Plugin {
 
 		try {
 			const manager = new S3TransferManager(this.app.vault, this.settings);
-			const result = await manager.fullSync(this.deviceId, (done, total) => {
+			const result = await manager.fullSync(this.deviceId, this.localLastSyncTime, (done, total) => {
 				this.updateStatusBar("uploading", {done, total});
 			});
+
+			// 同步成功后更新本地上次同步时间
+			this.localLastSyncTime = Date.now();
+			this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
 
 			this.updateStatusBar("done");
 
@@ -274,6 +287,7 @@ export default class S3SyncPlugin extends Plugin {
 				if (result.uploaded > 0) lines.push(`上传 ${result.uploaded} 个文件`);
 				if (result.downloaded > 0) lines.push(`下载 ${result.downloaded} 个文件`);
 				if (result.deleted > 0) lines.push(`删除 ${result.deleted} 个云端文件`);
+					if (result.localDeleted > 0) lines.push(`删除 ${result.localDeleted} 个本地文件`);
 				if (result.orphanCleaned > 0) lines.push(`清理 ${result.orphanCleaned} 个云端孤儿文件`);
 				if (result.failed.length > 0) lines.push(`${result.failed.length} 个文件失败`);
 				if (result.conflicts.length > 0) lines.push(`${result.conflicts.length} 个冲突待处理`);

@@ -120,6 +120,7 @@ export class S3SyncSettingTab extends PluginSettingTab {
 				.onChange(async (value) => {
 					this.plugin.settings.autoSync = value;
 					await this.plugin.saveSettings();
+					this.plugin.setupAutoSync();
 				}));
 
 		new Setting(containerEl)
@@ -133,6 +134,7 @@ export class S3SyncSettingTab extends PluginSettingTab {
 					if (!isNaN(num) && num > 0) {
 						this.plugin.settings.syncInterval = num;
 						await this.plugin.saveSettings();
+						this.plugin.setupAutoSync();
 					}
 				}));
 
@@ -165,12 +167,13 @@ export class S3SyncSettingTab extends PluginSettingTab {
 							const {S3TransferManager} = await import("./transfer");
 							const manager = new S3TransferManager(this.app.vault, this.plugin.settings);
 							const deviceId = await this.plugin.getDeviceId();
-							const result = await manager.fullSync(deviceId);
+							const result = await manager.fullSync(deviceId, 0);
 
 							const lines: string[] = [];
 							if (result.uploaded > 0) lines.push(`上传 ${result.uploaded}`);
 							if (result.downloaded > 0) lines.push(`下载 ${result.downloaded}`);
 							if (result.deleted > 0) lines.push(`删除 ${result.deleted}`);
+								if (result.localDeleted > 0) lines.push(`本地删除 ${result.localDeleted}`);
 							if (result.orphanCleaned > 0) lines.push(`清理孤儿 ${result.orphanCleaned}`);
 							if (result.failed.length > 0) lines.push(`失败 ${result.failed.length}`);
 

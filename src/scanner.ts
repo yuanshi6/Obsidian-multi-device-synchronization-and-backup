@@ -26,6 +26,7 @@ export interface SyncManifest {
 	deviceId: string;
 	lastSyncTime: number;
 	files: Record<string, FileEntry>;
+	deleted: Record<string, number>; // 已删除文件路径 → 删除时间戳
 }
 
 // ── Diff 输出 ──
@@ -33,7 +34,8 @@ export interface SyncManifest {
 export interface SyncDelta {
 	uploadQueue: string[];
 	downloadQueue: string[];
-	deleteQueue: string[];
+	deleteQueue: string[];       // 删除云端文件（本地已删除）
+	localDeleteQueue: string[];  // 删除本地文件（云端已删除）
 	conflictQueue: string[];
 }
 
@@ -99,15 +101,18 @@ export function computeSyncDelta(
 	localFiles: Record<string, FileEntry>,
 	cloudManifest: SyncManifest | null,
 	currentDeviceId: string = "",
+	localLastSyncTime: number = 0,
 ): SyncDelta {
 	const uploadQueue: string[] = [];
 	const downloadQueue: string[] = [];
 	const deleteQueue: string[] = [];
+	const localDeleteQueue: string[] = [];
 	const conflictQueue: string[] = [];
 
 	const cloudFiles = cloudManifest?.files ?? {};
-	const lastSyncTime = cloudManifest?.lastSyncTime ?? 0;
+	const cloudLastSyncTime = cloudManifest?.lastSyncTime ?? 0;
 	const manifestDeviceId = cloudManifest?.deviceId ?? "";
+	const cloudDeleted = cloudManifest?.deleted ?? {};
 
 	const allPaths = new Set<string>([
 		...Object.keys(localFiles),
@@ -119,14 +124,23 @@ export function computeSyncDelta(
 		const cloud = cloudFiles[path];
 
 		if (local && !cloud) {
-			// 仅本地存在 → 上传
-			uploadQueue.push(path);
+			// 仅本地存在
+			if (cloudDeleted[path]) {
+				// 云端已标记删除 → 删本地
+				localDeleteQueue.push(path);
+			} else if (localLastSyncTime > 0 && local.mtime <= localLastSyncTime) {
+				// 本地上次同步后未修改，但云端已删除 → 删本地
+				localDeleteQueue.push(path);
+			} else {
+				// 本地新增 → 上传
+				uploadQueue.push(path);
+			}
 		} else if (!local && cloud) {
 			// 仅云端存在
 			if (currentDeviceId && manifestDeviceId && currentDeviceId === manifestDeviceId) {
 				// manifest 是本机上次上传的 → 本地已删除，从云端删除
 				deleteQueue.push(path);
-			} else if (lastSyncTime > 0 && cloud.mtime <= lastSyncTime) {
+			} else if (cloudLastSyncTime > 0 && cloud.mtime <= cloudLastSyncTime) {
 				// 云端 mtime 早于上次同步 → 本地已删除
 				deleteQueue.push(path);
 			} else {
@@ -137,8 +151,8 @@ export function computeSyncDelta(
 			// 两端都存在，比较 mtime
 			if (local.mtime === cloud.mtime) continue;
 
-			const localChanged = local.mtime > lastSyncTime;
-			const cloudChanged = cloud.mtime > lastSyncTime;
+			const localChanged = local.mtime > localLastSyncTime;
+			const cloudChanged = cloud.mtime > cloudLastSyncTime;
 
 			if (localChanged && cloudChanged) {
 				// 两端均在同步后修改 → 冲突
@@ -151,5 +165,5 @@ export function computeSyncDelta(
 		}
 	}
 
-	return {uploadQueue, downloadQueue, deleteQueue, conflictQueue};
+	return {uploadQueue, downloadQueue, deleteQueue, localDeleteQueue, conflictQueue};
 }
