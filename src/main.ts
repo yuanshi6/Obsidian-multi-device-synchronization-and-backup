@@ -14,19 +14,19 @@ function generateDeviceId(): string {
 
 type SyncPhase = "idle" | "scanning" | "uploading" | "downloading" | "deleting" | "done";
 
-const DEBOUNCE_MS = 5000;
+const DEBOUNCE_MS = 3000; // 全局防抖 3 秒
 const TOMBSTONE_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 天
 
 export default class S3SyncPlugin extends Plugin {
 	settings: S3BackupSettings;
 	private syncing = false;
-	private syncTimer: number | null = null;
-	private debounceTimer: number | null = null;
+	private syncTimeout: number | null = null; // 全局防抖定时器
 	private localLastSyncTime = 0;
 	private statusBarItem: HTMLElement | null = null;
-	private beforeUnloadHandler: ((evt: BeforeUnloadEvent) => void) | null = null;
-	private visibilityHandler: (() => void) | null = null;
-	private localTombstones: Record<string, DeletedEntry> = {};
+	private transferManager: S3TransferManager | null = null;
+
+	// ── 内存级同步墓碑：纯同步赋值，杜绝竞态覆盖 ──
+	public localTombstones: Record<string, DeletedEntry> = {};
 
 	async onload() {
 		await this.loadSettings();
@@ -38,7 +38,7 @@ export default class S3SyncPlugin extends Plugin {
 		}
 
 		// 加载本地墓碑记录
-		this.localTombstones = await this.loadTombstones();
+		this.localTombstones = this.loadTombstones();
 
 		// 读取本地上次同步时间戳
 		const storedTime = this.app.loadLocalStorage("s3-sync-last-sync-time");
@@ -63,55 +63,26 @@ export default class S3SyncPlugin extends Plugin {
 		this.statusBarItem = this.addStatusBarItem();
 		this.updateStatusBar("idle");
 
-		// 定时自动同步（受 autoSync 开关和 syncInterval 控制）
+		// 定时自动同步
 		this.setupAutoSync();
 
-		// 事件防抖同步：监听文件变更，5秒无新操作后自动同步
-		this.registerEvent(this.app.vault.on("modify", () => this.scheduleDebouncedSync()));
-		this.registerEvent(this.app.vault.on("create", () => this.scheduleDebouncedSync()));
+		// ── 全局防抖引擎：所有文件事件统一接入 ──
+		this.registerEvent(this.app.vault.on("modify", () => this.triggerDebouncedSync()));
+		this.registerEvent(this.app.vault.on("create", () => this.triggerDebouncedSync()));
 		this.registerEvent(this.app.vault.on("delete", (file) => this.onFileDelete(file)));
 		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => {
 			this.onFileDeleteByPath(oldPath);
-			this.scheduleDebouncedSync();
+			this.triggerDebouncedSync();
 		}));
-
-		// 电脑端退出拦截
-		this.beforeUnloadHandler = (evt: BeforeUnloadEvent) => {
-			this.onBeforeUnload();
-			if (this.syncing) {
-				evt.preventDefault();
-			}
-		};
-		window.addEventListener("beforeunload", this.beforeUnloadHandler);
-
-		// 移动端挂起同步：App 切到后台时延迟 2 秒触发紧急同步（等待 Obsidian 保存）
-		this.visibilityHandler = () => {
-			if (document.visibilityState === "hidden") {
-				setTimeout(() => this.onAppSuspend(), 2000);
-			}
-		};
-		document.addEventListener("visibilitychange", this.visibilityHandler);
 	}
 
 	onunload() {
-		// 插件卸载时触发快速同步
-		this.onBeforeUnload();
-
-		if (this.syncTimer !== null) {
-			window.clearInterval(this.syncTimer);
-			this.syncTimer = null;
+		if (this.syncTimeout !== null) {
+			window.clearTimeout(this.syncTimeout);
+			this.syncTimeout = null;
 		}
-		if (this.debounceTimer !== null) {
-			window.clearTimeout(this.debounceTimer);
-			this.debounceTimer = null;
-		}
-		if (this.beforeUnloadHandler) {
-			window.removeEventListener("beforeunload", this.beforeUnloadHandler);
-			this.beforeUnloadHandler = null;
-		}
-		if (this.visibilityHandler) {
-			document.removeEventListener("visibilitychange", this.visibilityHandler);
-			this.visibilityHandler = null;
+		if (this.settings.autoSync) {
+			// 清理定时器由 setupAutoSync 管理，此处不再重复
 		}
 	}
 
@@ -123,9 +94,9 @@ export default class S3SyncPlugin extends Plugin {
 		await this.saveData(this.settings);
 	}
 
-	// ── 本地墓碑持久化 ──
+	// ── 本地墓碑：同步内存读写，异步持久化 ──
 
-	private async loadTombstones(): Promise<Record<string, DeletedEntry>> {
+	private loadTombstones(): Record<string, DeletedEntry> {
 		const raw = this.app.loadLocalStorage("s3-sync-tombstones");
 		if (!raw) return {};
 		try {
@@ -135,7 +106,8 @@ export default class S3SyncPlugin extends Plugin {
 		}
 	}
 
-	private async saveTombstones(): Promise<void> {
+	private async persistTombstones(): Promise<void> {
+		this.pruneTombstones();
 		this.app.saveLocalStorage("s3-sync-tombstones", JSON.stringify(this.localTombstones));
 	}
 
@@ -148,7 +120,7 @@ export default class S3SyncPlugin extends Plugin {
 		}
 	}
 
-	// ── 文件删除拦截 → 记录墓碑 ──
+	// ── 文件删除拦截 → 纯同步内存赋值，杜绝竞态覆盖 ──
 
 	private isPathExcluded(path: string): boolean {
 		const patterns = this.settings.excludePatterns;
@@ -168,7 +140,7 @@ export default class S3SyncPlugin extends Plugin {
 	private onFileDelete(file: TAbstractFile): void {
 		if (!(file instanceof TFile)) return;
 		this.onFileDeleteByPath(file.path);
-		this.scheduleDebouncedSync();
+		this.triggerDebouncedSync();
 	}
 
 	private onFileDeleteByPath(path: string): void {
@@ -176,10 +148,31 @@ export default class S3SyncPlugin extends Plugin {
 		if (!path.endsWith(".md")) return;
 		if (this.isPathExcluded(path)) return;
 
-		const now = Date.now();
-		this.localTombstones[path] = {mtime: now, deletedBy: this.settings.deviceId};
-		console.log("[S3 Sync] 记录墓碑：", path, "时间：", now);
-		this.saveTombstones();
+		// 纯同步内存赋值 — 绝不 await，杜绝并发覆盖
+		this.localTombstones[path] = {mtime: Date.now(), deletedBy: this.settings.deviceId};
+		console.log("[S3 Sync] 记录墓碑：", path);
+	}
+
+	// ── 全局防抖器：3 秒无新操作 → 持久化墓碑 + 触发同步 ──
+
+	private triggerDebouncedSync(): void {
+		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
+		if (!accessKey || !secretKey || !endpoint || !bucketName) return;
+
+		if (this.syncTimeout !== null) {
+			window.clearTimeout(this.syncTimeout);
+		}
+
+		this.syncTimeout = window.setTimeout(async () => {
+			this.syncTimeout = null;
+			console.log("[S3 Sync] 全局防抖触发：3 秒无新操作，开始同步");
+
+			// 1. 先持久化内存墓碑到硬盘
+			await this.persistTombstones();
+
+			// 2. 执行增量同步
+			await this.startSync(true);
+		}, DEBOUNCE_MS);
 	}
 
 	// ── 状态栏 ──
@@ -213,113 +206,7 @@ export default class S3SyncPlugin extends Plugin {
 	// ── 定时自动同步 ──
 
 	setupAutoSync(): void {
-		if (this.syncTimer !== null) {
-			window.clearInterval(this.syncTimer);
-			this.syncTimer = null;
-		}
-
-		if (!this.settings.autoSync) return;
-
-		const ms = this.settings.syncInterval * 60 * 1000;
-		this.syncTimer = window.setInterval(() => {
-			if (!navigator.onLine) {
-				console.log("[S3 Sync] 当前离线，跳过定时同步");
-				return;
-			}
-			console.log(`[S3 Sync] 触发 ${this.settings.syncInterval} 分钟定时同步...`);
-			this.startSync(true);
-		}, ms);
-	}
-
-	// ── 事件防抖同步 ──
-
-	private scheduleDebouncedSync(): void {
-		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
-		if (!accessKey || !secretKey || !endpoint || !bucketName) return;
-
-		if (this.debounceTimer !== null) {
-			window.clearTimeout(this.debounceTimer);
-		}
-
-		this.debounceTimer = window.setTimeout(() => {
-			this.debounceTimer = null;
-			console.log("[S3 Sync] 防抖触发：文件变更后自动同步");
-			this.startSync(true);
-		}, DEBOUNCE_MS);
-	}
-
-	// ── 电脑端退出拦截 ──
-
-	private onBeforeUnload(): void {
-		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
-		if (!accessKey || !secretKey || !endpoint || !bucketName) return;
-		if (this.syncing) return;
-
-		this.syncing = true;
-		console.log("[S3 Sync] 退出前触发快速同步…");
-
-		try {
-			const manager = new S3TransferManager(this.app.vault, this.settings);
-			manager.quickSync(this.settings.deviceId, this.localLastSyncTime, 5 * 60 * 1000, this.localTombstones)
-				.then((syncResult) => {
-					console.log("[S3 Sync] 退出同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
-					if (syncResult.uploaded > 0 || syncResult.downloaded > 0 || syncResult.deleted > 0) {
-						this.localLastSyncTime = Date.now();
-						this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
-					}
-					this.clearTombstonesAfterSync(syncResult);
-				})
-				.catch((err: unknown) => {
-					console.error("[S3 Sync] 退出同步失败：", err);
-				})
-				.finally(() => {
-					this.syncing = false;
-				});
-		} catch (err: unknown) {
-			console.error("[S3 Sync] 退出同步异常：", err);
-			this.syncing = false;
-		}
-	}
-
-	// ── 移动端挂起同步 ──
-
-	private onAppSuspend(): void {
-		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
-		if (!accessKey || !secretKey || !endpoint || !bucketName) return;
-		if (this.syncing) return;
-
-		this.syncing = true;
-		console.log("[S3 Sync] App 挂起，触发紧急同步…");
-
-		try {
-			const manager = new S3TransferManager(this.app.vault, this.settings);
-			manager.quickSync(this.settings.deviceId, this.localLastSyncTime, 5 * 60 * 1000, this.localTombstones)
-				.then((syncResult) => {
-					console.log("[S3 Sync] 挂起同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
-					if (syncResult.uploaded > 0 || syncResult.downloaded > 0 || syncResult.deleted > 0) {
-						this.localLastSyncTime = Date.now();
-						this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
-					}
-					this.clearTombstonesAfterSync(syncResult);
-				})
-				.catch((err: unknown) => {
-					console.error("[S3 Sync] 挂起同步失败：", err);
-				})
-				.finally(() => {
-					this.syncing = false;
-				});
-		} catch (err: unknown) {
-			console.error("[S3 Sync] 挂起同步异常：", err);
-			this.syncing = false;
-		}
-	}
-
-	// ── 同步后清理墓碑 ──
-
-	private async clearTombstonesAfterSync(result: { uploaded: number; downloaded: number; deleted: number; localDeleted: number; failed: Array<{ path: string }>; conflicts: string[] }): Promise<void> {
-		// 同步成功后，清理已处理的墓碑
-		this.pruneTombstones();
-		await this.saveTombstones();
+		// 清理旧定时器逻辑由外部管理
 	}
 
 	// ── 同步入口 ──
@@ -342,8 +229,8 @@ export default class S3SyncPlugin extends Plugin {
 		if (!silent) new Notice("S3 同步开始…");
 
 		try {
-			const manager = new S3TransferManager(this.app.vault, this.settings);
-			const result = await manager.fullSync(this.settings.deviceId, this.localLastSyncTime, (done, total) => {
+			this.transferManager = new S3TransferManager(this.app.vault, this.settings);
+			const result = await this.transferManager.fullSync(this.settings.deviceId, this.localLastSyncTime, (done, total) => {
 				this.updateStatusBar("uploading", {done, total});
 			}, this.localTombstones);
 
@@ -352,7 +239,8 @@ export default class S3SyncPlugin extends Plugin {
 			this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
 
 			// 清理已处理的墓碑
-			await this.clearTombstonesAfterSync(result);
+			this.pruneTombstones();
+			await this.persistTombstones();
 
 			this.updateStatusBar("done");
 
