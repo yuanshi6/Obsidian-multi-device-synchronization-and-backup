@@ -11,7 +11,7 @@ function generateDeviceId(): string {
 	return id;
 }
 
-type SyncPhase = "idle" | "scanning" | "uploading" | "downloading" | "done";
+type SyncPhase = "idle" | "scanning" | "uploading" | "downloading" | "deleting" | "done";
 
 export default class S3SyncPlugin extends Plugin {
 	settings: S3BackupSettings;
@@ -49,15 +49,19 @@ export default class S3SyncPlugin extends Plugin {
 
 		// 退出拦截
 		this.beforeUnloadHandler = (evt: BeforeUnloadEvent) => {
+			this.onBeforeUnload();
+			// 如果正在同步，请求延迟关闭
 			if (this.syncing) {
 				evt.preventDefault();
 			}
-			this.onBeforeUnload();
 		};
 		window.addEventListener("beforeunload", this.beforeUnloadHandler);
 	}
 
 	onunload() {
+		// 插件卸载时也触发一次快速同步
+		this.onBeforeUnload();
+
 		if (this.syncTimer !== null) {
 			window.clearInterval(this.syncTimer);
 			this.syncTimer = null;
@@ -94,6 +98,9 @@ export default class S3SyncPlugin extends Plugin {
 			case "downloading":
 				this.statusBarItem.setText(`🔄 下载中 (${progress?.done ?? 0}/${progress?.total ?? 0})`);
 				break;
+			case "deleting":
+				this.statusBarItem.setText(`🔄 删除中 (${progress?.done ?? 0}/${progress?.total ?? 0})`);
+				break;
 			case "done":
 				this.statusBarItem.setText("✅ 同步完成");
 				setTimeout(() => this.updateStatusBar("idle"), 3000);
@@ -122,11 +129,28 @@ export default class S3SyncPlugin extends Plugin {
 	private onBeforeUnload(): void {
 		const {accessKey, secretKey, endpoint, bucketName} = this.settings;
 		if (!accessKey || !secretKey || !endpoint || !bucketName) return;
+		if (this.syncing) return;
 
-		// 同步执行：仅上传近 5 分钟内修改的文件
-		const manager = new S3TransferManager(this.app.vault, this.settings);
-		// 使用 .then() 不阻塞关闭流程，但浏览器会等待微任务
-		manager.quickSync(this.deviceId, 5 * 60 * 1000).catch(() => {});
+		this.syncing = true;
+		console.log("[S3 Sync] 退出前触发快速同步…");
+
+		try {
+			const manager = new S3TransferManager(this.app.vault, this.settings);
+			// 使用 .then() 不阻塞关闭流程
+			manager.quickSync(this.deviceId, 5 * 60 * 1000)
+				.then((syncResult) => {
+					console.log("[S3 Sync] 退出同步完成：上传", syncResult.uploaded, "删除", syncResult.deleted);
+				})
+				.catch((err: unknown) => {
+					console.error("[S3 Sync] 退出同步失败：", err);
+				})
+				.finally(() => {
+					this.syncing = false;
+				});
+		} catch (err: unknown) {
+			console.error("[S3 Sync] 退出同步异常：", err);
+			this.syncing = false;
+		}
 	}
 
 	// ── 设备 ID ──
@@ -162,13 +186,7 @@ export default class S3SyncPlugin extends Plugin {
 		try {
 			const manager = new S3TransferManager(this.app.vault, this.settings);
 			const result = await manager.fullSync(this.deviceId, (done, total) => {
-				// 根据进度判断当前阶段
-				const uploadCount = Math.min(done, result.uploaded + result.failed.length);
-				if (uploadCount < total) {
-					this.updateStatusBar("uploading", {done, total});
-				} else {
-					this.updateStatusBar("downloading", {done, total});
-				}
+				this.updateStatusBar("uploading", {done, total});
 			});
 
 			this.updateStatusBar("done");
@@ -177,6 +195,8 @@ export default class S3SyncPlugin extends Plugin {
 				const lines: string[] = [];
 				if (result.uploaded > 0) lines.push(`上传 ${result.uploaded} 个文件`);
 				if (result.downloaded > 0) lines.push(`下载 ${result.downloaded} 个文件`);
+				if (result.deleted > 0) lines.push(`删除 ${result.deleted} 个云端文件`);
+				if (result.orphanCleaned > 0) lines.push(`清理 ${result.orphanCleaned} 个云端孤儿文件`);
 				if (result.failed.length > 0) lines.push(`${result.failed.length} 个文件失败`);
 				if (result.conflicts.length > 0) lines.push(`${result.conflicts.length} 个冲突待处理`);
 

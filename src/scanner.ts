@@ -33,6 +33,7 @@ export interface SyncManifest {
 export interface SyncDelta {
 	uploadQueue: string[];
 	downloadQueue: string[];
+	deleteQueue: string[];
 	conflictQueue: string[];
 }
 
@@ -54,12 +55,10 @@ export class FileScanner {
 		if (trimmed.length === 0) return null;
 
 		const parts = trimmed.map(p => {
-			// 将通配符模式转为正则：* → .*, ? → .
 			const escaped = p
 				.replace(/[.+^${}()|[\]\\]/g, "\\$&")
 				.replace(/\*/g, ".*")
 				.replace(/\?/g, ".");
-			// 匹配路径中任意位置出现该模式
 			return `(?:^|/)${escaped}(?:/|$)`;
 		});
 		return new RegExp(parts.join("|"));
@@ -94,18 +93,21 @@ export class FileScanner {
 	}
 }
 
-// ── Diff 算法 ──
+// ── Diff 算法（支持双向删除同步）──
 
 export function computeSyncDelta(
 	localFiles: Record<string, FileEntry>,
 	cloudManifest: SyncManifest | null,
+	currentDeviceId: string = "",
 ): SyncDelta {
 	const uploadQueue: string[] = [];
 	const downloadQueue: string[] = [];
+	const deleteQueue: string[] = [];
 	const conflictQueue: string[] = [];
 
 	const cloudFiles = cloudManifest?.files ?? {};
 	const lastSyncTime = cloudManifest?.lastSyncTime ?? 0;
+	const manifestDeviceId = cloudManifest?.deviceId ?? "";
 
 	const allPaths = new Set<string>([
 		...Object.keys(localFiles),
@@ -120,8 +122,17 @@ export function computeSyncDelta(
 			// 仅本地存在 → 上传
 			uploadQueue.push(path);
 		} else if (!local && cloud) {
-			// 仅云端存在 → 下载
-			downloadQueue.push(path);
+			// 仅云端存在
+			if (currentDeviceId && manifestDeviceId && currentDeviceId === manifestDeviceId) {
+				// manifest 是本机上次上传的 → 本地已删除，从云端删除
+				deleteQueue.push(path);
+			} else if (lastSyncTime > 0 && cloud.mtime <= lastSyncTime) {
+				// 云端 mtime 早于上次同步 → 本地已删除
+				deleteQueue.push(path);
+			} else {
+				// 其他设备新增 → 下载到本地
+				downloadQueue.push(path);
+			}
 		} else if (local && cloud) {
 			// 两端都存在，比较 mtime
 			if (local.mtime === cloud.mtime) continue;
@@ -140,5 +151,5 @@ export function computeSyncDelta(
 		}
 	}
 
-	return {uploadQueue, downloadQueue, conflictQueue};
+	return {uploadQueue, downloadQueue, deleteQueue, conflictQueue};
 }

@@ -1,4 +1,4 @@
-import {GetObjectCommand, PutObjectCommand, S3Client} from "@aws-sdk/client-s3";
+import {DeleteObjectCommand, GetObjectCommand, ListObjectsV2Command, ListObjectsV2CommandOutput, PutObjectCommand, S3Client} from "@aws-sdk/client-s3";
 import {Notice, Vault} from "obsidian";
 import {S3BackupSettings} from "./settings";
 import {computeSyncDelta, FileEntry, FileScanner, normalizeSyncPath, SyncDelta, SyncManifest} from "./scanner";
@@ -39,6 +39,8 @@ function emptyManifest(): SyncManifest {
 export interface SyncResult {
 	uploaded: number;
 	downloaded: number;
+	deleted: number;
+	orphanCleaned: number;
 	failed: Array<{ path: string; error: string }>;
 	conflicts: string[];
 }
@@ -87,6 +89,15 @@ export class S3TransferManager {
 		return {content: body, mtime};
 	}
 
+	async deleteFile(path: string): Promise<void> {
+		const key = cleanS3Key(path);
+		console.log("[S3 Sync] 删除云端文件：", key);
+		await this.client.send(new DeleteObjectCommand({
+			Bucket: this.bucket,
+			Key: key,
+		}));
+	}
+
 	async fetchCloudManifest(): Promise<SyncManifest> {
 		try {
 			const resp = await this.client.send(new GetObjectCommand({
@@ -119,11 +130,71 @@ export class S3TransferManager {
 		}));
 	}
 
-	// ── 并发池：for 循环 + Promise.race，无闭包递归 ──
+	// ── 云端孤儿文件清理 ──
 
-	private async processWithConcurrency(
+	async cleanOrphanFiles(cloudManifest: SyncManifest): Promise<number> {
+		const manifestKeys = new Set(Object.keys(cloudManifest.files));
+		manifestKeys.add("manifest.json");
+
+		const orphanKeys: string[] = [];
+
+		try {
+			let continuationToken: string | undefined = undefined;
+			do {
+				const resp: ListObjectsV2CommandOutput = await this.client.send(new ListObjectsV2Command({
+					Bucket: this.bucket,
+					ContinuationToken: continuationToken,
+				}));
+
+				const contents = resp.Contents;
+				if (contents) {
+					for (const obj of contents) {
+						const objKey = obj.Key;
+						if (objKey && !manifestKeys.has(objKey)) {
+							orphanKeys.push(objKey);
+						}
+					}
+				}
+
+				continuationToken = resp.IsTruncated ? resp.NextContinuationToken : undefined;
+			} while (continuationToken);
+		} catch (err: unknown) {
+			const msg = err instanceof Error ? err.message : String(err);
+			console.warn("[S3 Sync] 列出云端对象失败，跳过孤儿清理：", msg);
+			return 0;
+		}
+
+		if (orphanKeys.length === 0) {
+			console.log("[S3 Sync] 云端无孤儿文件");
+			return 0;
+		}
+
+		console.log(`[S3 Sync] 发现 ${orphanKeys.length} 个云端孤儿文件：`, orphanKeys);
+
+		let cleaned = 0;
+		for (const key of orphanKeys) {
+			try {
+				await this.client.send(new DeleteObjectCommand({
+					Bucket: this.bucket,
+					Key: key,
+				}));
+				cleaned++;
+				console.log("[S3 Sync] 已清理孤儿文件：", key);
+			} catch (err: unknown) {
+				const msg = err instanceof Error ? err.message : String(err);
+				console.warn("[S3 Sync] 清理孤儿文件失败：", key, msg);
+			}
+		}
+
+		console.log(`[S3 Sync] 清理了 ${cleaned} 个云端无主文件`);
+		return cleaned;
+	}
+
+	// ── 并发池：for 循环 + Set + Promise.race ──
+
+	private async runConcurrent(
 		paths: string[],
-		mode: "upload" | "download",
+		mode: "upload" | "download" | "delete",
 		localFiles: Record<string, FileEntry>,
 		totalCount: number,
 		doneCount: { value: number },
@@ -133,7 +204,7 @@ export class S3TransferManager {
 		const inFlight: Set<Promise<void>> = new Set();
 		let nextIndex = 0;
 
-		const processOne = async (itemPath: string): Promise<void> => {
+		const executeOne = async (itemPath: string): Promise<void> => {
 			let lastError = "";
 			for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
 				try {
@@ -143,10 +214,13 @@ export class S3TransferManager {
 						const itemMtime = localFiles[itemPath]?.mtime ?? Date.now();
 						await this.uploadFile(itemPath, byteContent, itemMtime);
 						result.uploaded++;
-					} else {
+					} else if (mode === "download") {
 						const dlData = await this.downloadFile(itemPath);
 						await adapter.write(itemPath, dlData.content);
 						result.downloaded++;
+					} else {
+						await this.deleteFile(itemPath);
+						result.deleted++;
 					}
 					lastError = "";
 					break;
@@ -165,19 +239,18 @@ export class S3TransferManager {
 
 			doneCount.value++;
 			const pct = Math.round((doneCount.value / totalCount) * 100);
-			console.log(`[S3 Sync] ${mode}完成 (${doneCount.value}/${totalCount} ${pct}%)：${itemPath}`);
-			new Notice(`${mode === "upload" ? "上传" : "下载"} (${doneCount.value}/${totalCount}) ${itemPath}`);
+			const modeLabel = mode === "upload" ? "上传" : mode === "download" ? "下载" : "删除";
+			console.log(`[S3 Sync] ${modeLabel}完成 (${doneCount.value}/${totalCount} ${pct}%)：${itemPath}`);
+			new Notice(`${modeLabel} (${doneCount.value}/${totalCount}) ${itemPath}`);
 		};
 
 		while (nextIndex < paths.length) {
-			// 填满并发槽
 			while (inFlight.size < MAX_CONCURRENCY && nextIndex < paths.length) {
 				const currentPath = paths[nextIndex];
 				nextIndex++;
-
 				if (currentPath == null) continue;
 
-				const task = processOne(currentPath);
+				const task = executeOne(currentPath);
 				inFlight.add(task);
 				task.then(
 					() => { inFlight.delete(task); },
@@ -185,17 +258,15 @@ export class S3TransferManager {
 				);
 			}
 
-			// 等待任意一个完成
 			if (inFlight.size > 0) {
 				await Promise.race(inFlight);
 			}
 		}
 
-		// 等待所有剩余任务
 		await Promise.all(inFlight);
 	}
 
-	// ── 处理上传/下载队列 ──
+	// ── 处理同步队列 ──
 
 	async processQueues(
 		delta: SyncDelta,
@@ -206,13 +277,15 @@ export class S3TransferManager {
 		const result: SyncResult = {
 			uploaded: 0,
 			downloaded: 0,
+			deleted: 0,
+			orphanCleaned: 0,
 			failed: [],
 			conflicts: delta.conflictQueue,
 		};
-
 		const uploadPaths = delta.uploadQueue;
 		const downloadPaths = delta.downloadQueue;
-		const totalCount = uploadPaths.length + downloadPaths.length;
+		const deletePaths = delta.deleteQueue;
+		const totalCount = uploadPaths.length + downloadPaths.length + deletePaths.length;
 		const doneCount = {value: 0};
 
 		if (totalCount === 0) {
@@ -222,13 +295,19 @@ export class S3TransferManager {
 		// ── 上传 ──
 		if (uploadPaths.length > 0) {
 			console.log(`[S3 Sync] 开始上传队列，共 ${uploadPaths.length} 个文件`);
-			await this.processWithConcurrency(uploadPaths, "upload", localFiles, totalCount, doneCount, result);
+			await this.runConcurrent(uploadPaths, "upload", localFiles, totalCount, doneCount, result);
 		}
 
 		// ── 下载 ──
 		if (downloadPaths.length > 0) {
 			console.log(`[S3 Sync] 开始下载队列，共 ${downloadPaths.length} 个文件`);
-			await this.processWithConcurrency(downloadPaths, "download", localFiles, totalCount, doneCount, result);
+			await this.runConcurrent(downloadPaths, "download", localFiles, totalCount, doneCount, result);
+		}
+
+		// ── 云端删除 ──
+		if (deletePaths.length > 0) {
+			console.log(`[S3 Sync] 开始删除队列，共 ${deletePaths.length} 个文件`);
+			await this.runConcurrent(deletePaths, "delete", localFiles, totalCount, doneCount, result);
 		}
 
 		// ── 冲突文件 ──
@@ -273,8 +352,8 @@ export class S3TransferManager {
 		console.log("[S3 Sync] 本地文件扫描完成，文件数：", Object.keys(localFiles).length);
 
 		const cloudManifest = await this.fetchCloudManifest();
-		const delta = computeSyncDelta(localFiles, cloudManifest);
-		console.log("[S3 Sync] Diff 完成：上传", delta.uploadQueue.length, "下载", delta.downloadQueue.length, "冲突", delta.conflictQueue.length);
+		const delta = computeSyncDelta(localFiles, cloudManifest, deviceId);
+		console.log("[S3 Sync] Diff 完成：上传", delta.uploadQueue.length, "下载", delta.downloadQueue.length, "删除", delta.deleteQueue.length, "冲突", delta.conflictQueue.length);
 
 		return this.processQueues(delta, localFiles, deviceId, onProgress);
 	}
@@ -284,24 +363,37 @@ export class S3TransferManager {
 	async quickSync(deviceId: string, recentMs: number): Promise<SyncResult> {
 		console.log("[S3 Sync] 开始快速同步，时间窗口：", recentMs, "ms");
 		const localFiles = await this.scanner.scanAll();
+		const cloudManifest = await this.fetchCloudManifest();
 		const cutoff = Date.now() - recentMs;
 
-		const recentPaths: string[] = [];
+		// 近期修改的文件 → 上传
+		const recentUploads: string[] = [];
 		for (const path in localFiles) {
 			if (localFiles[path]!.mtime >= cutoff) {
-				recentPaths.push(path);
+				recentUploads.push(path);
 			}
 		}
 
-		if (recentPaths.length === 0) {
-			console.log("[S3 Sync] 无近期修改文件，跳过");
-			return {uploaded: 0, downloaded: 0, failed: [], conflicts: []};
+		// 近期本地删除的文件 → 云端删除
+		const recentDeletes: string[] = [];
+		if (cloudManifest) {
+			for (const path in cloudManifest.files) {
+				if (!localFiles[path] && cloudManifest.files[path]!.mtime <= cloudManifest.lastSyncTime) {
+					recentDeletes.push(path);
+				}
+			}
 		}
 
-		console.log("[S3 Sync] 近期修改文件数：", recentPaths.length);
+		if (recentUploads.length === 0 && recentDeletes.length === 0) {
+			console.log("[S3 Sync] 无近期变更，跳过");
+			return {uploaded: 0, downloaded: 0, deleted: 0, orphanCleaned: 0, failed: [], conflicts: []};
+		}
+
+		console.log("[S3 Sync] 近期变更：上传", recentUploads.length, "删除", recentDeletes.length);
 		const delta: SyncDelta = {
-			uploadQueue: recentPaths,
+			uploadQueue: recentUploads,
 			downloadQueue: [],
+			deleteQueue: recentDeletes,
 			conflictQueue: [],
 		};
 
