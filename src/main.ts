@@ -1,6 +1,6 @@
 import {Notice, Plugin, TAbstractFile, TFile} from "obsidian";
 import {DEFAULT_SETTINGS, S3BackupSettings, S3SyncSettingTab} from "./settings";
-import {DeletedEntry, FileState, FileScanner} from "./scanner";
+import {createDeletedEntry, DeletedEntry, FileState, FileScanner, mergeDiskWithLedger, normalizeDeletedEntry, normalizeFileState} from "./scanner";
 import {S3TransferManager} from "./transfer";
 
 function generateDeviceId(): string {
@@ -15,11 +15,11 @@ function generateDeviceId(): string {
 type SyncPhase = "idle" | "scanning" | "uploading" | "downloading" | "deleting" | "done";
 
 const DEBOUNCE_MS = 3000;
-const TOMBSTONE_EXPIRY_MS = 30 * 24 * 60 * 60 * 1000; // 30 天 = 2592000000 毫秒
 
 export default class S3SyncPlugin extends Plugin {
 	settings: S3BackupSettings;
-	private syncing = false;
+	private _syncing = false;
+	public isSyncing = false;
 	private syncTimeout: number | null = null;
 	private localLastSyncTime = 0;
 	private statusBarItem: HTMLElement | null = null;
@@ -49,9 +49,7 @@ export default class S3SyncPlugin extends Plugin {
 		const storedTime = this.app.loadLocalStorage("s3-sync-last-sync-time");
 		this.localLastSyncTime = storedTime ? parseInt(storedTime, 10) : 0;
 
-		// ── 任务一：启动核对逻辑 — 检测外部修改的灯下黑 ──
-		// Obsidian 关闭期间用其他编辑器修改的文件，modify 事件未触发
-		// 对比 stat.mtime 与账本 lastPenDropTime，发现异常新则标记脏
+		// ── 启动核对：用真实内容哈希检测 Obsidian 关闭期间的外部修改 ──
 		await this.detectExternalModifications();
 
 		// Ribbon 图标
@@ -78,7 +76,7 @@ export default class S3SyncPlugin extends Plugin {
 
 		// ── 观察者事件 ──
 		this.registerEvent(this.app.vault.on("modify", (file) => this.onFileModify(file)));
-		this.registerEvent(this.app.vault.on("create", (file) => this.onFileModify(file)));
+		this.registerEvent(this.app.vault.on("create", (file) => this.onFileCreate(file)));
 		this.registerEvent(this.app.vault.on("delete", (file) => this.onFileDelete(file)));
 		// ── 任务二：重命名/移动拦截器 ──
 		this.registerEvent(this.app.vault.on("rename", (file, oldPath) => this.onFileRename(file, oldPath)));
@@ -100,7 +98,7 @@ export default class S3SyncPlugin extends Plugin {
 	}
 
 	// ══════════════════════════════════════════════════════════
-	// 任务一：启动核对 — 检测外部修改的灯下黑
+	// 启动核对 — 检测外部修改的灯下黑
 	// ══════════════════════════════════════════════════════════
 
 	private async detectExternalModifications(): Promise<void> {
@@ -112,27 +110,18 @@ export default class S3SyncPlugin extends Plugin {
 			const ledgerEntry = this.localLedger[path];
 
 			if (!ledgerEntry) {
-				// 账本无记录 → 新文件或冷启动，默认脏
-				this.localLedger[path] = {
-					lastPenDropTime: diskEntry.lastPenDropTime,
-					isUploaded: false,
-					hash: diskEntry.hash,
-					lastModifiedBy: this.settings.deviceId,
-				};
+				// 账本无记录 → 新文件或冷启动，默认基于版本 0
+				this.localLedger[path] = diskEntry;
 				dirtyCount++;
 				continue;
 			}
 
-			// 核心判定：真实 mtime 异常新于账本落笔时间 → 外部修改
-			if (diskEntry.lastPenDropTime > ledgerEntry.lastPenDropTime) {
-				this.localLedger[path] = {
-					lastPenDropTime: diskEntry.lastPenDropTime,
-					isUploaded: false, // 标记脏，触发重新上传
-					hash: diskEntry.hash,
-					lastModifiedBy: this.settings.deviceId,
-				};
+			const merged = mergeDiskWithLedger(path, diskEntry, ledgerEntry, this.settings.deviceId);
+			const previous = normalizeFileState(path, ledgerEntry, this.settings.deviceId);
+			if (merged.contentHash !== previous.contentHash) {
+				this.localLedger[path] = merged;
 				dirtyCount++;
-				console.log("[S3 Sync] 启动核对：检测到外部修改", path, "账本", ledgerEntry.lastPenDropTime, "→ 磁盘", diskEntry.lastPenDropTime);
+				console.log("[S3 Sync] 启动核对：检测到外部修改", path, "baseVersion", merged.baseVersion);
 			}
 		}
 
@@ -160,33 +149,42 @@ export default class S3SyncPlugin extends Plugin {
 
 		const newPath = file.path;
 
-		// 1. 将旧路径的账本记录完整转移给新路径
+		// 1. 将旧路径的账本记录转移给新路径，并为旧路径保留删除墓碑
 		const oldEntry = this.localLedger[oldPath];
 		if (oldEntry) {
+			const normalizedOld = normalizeFileState(oldPath, oldEntry, this.settings.deviceId);
 			this.localLedger[newPath] = {
-				...oldEntry,
-				isUploaded: false, // 重命名视为修改，需重新上传
+				...normalizedOld,
+				fileId: normalizedOld.fileId || oldPath,
+				parentHash: "",
+				mtime: Date.now(),
 				lastModifiedBy: this.settings.deviceId,
 			};
 			delete this.localLedger[oldPath];
+			this.localTombstones[oldPath] = createDeletedEntry(
+				oldPath,
+				this.settings.deviceId,
+				normalizedOld.version,
+				normalizedOld.fileId,
+				normalizedOld.contentHash,
+				normalizedOld.remoteRevision,
+			);
 			console.log("[S3 Sync] 重命名拦截：账本转移", oldPath, "→", newPath);
 		} else {
 			// 旧路径无账本记录（可能是外部创建的文件），新建条目
+			const oldTomb = this.localTombstones[newPath]
+				? normalizeDeletedEntry(newPath, this.localTombstones[newPath], this.settings.deviceId)
+				: undefined;
 			this.localLedger[newPath] = {
-				lastPenDropTime: Date.now(),
-				isUploaded: false,
-				hash: "",
+				fileId: newPath,
+				version: oldTomb?.version ?? 0,
+				baseVersion: oldTomb?.version ?? 0,
+				contentHash: "",
+				mtime: Date.now(),
 				lastModifiedBy: this.settings.deviceId,
+				parentHash: oldTomb?.contentHash ?? "",
 			};
 			console.log("[S3 Sync] 重命名拦截：新建账本", newPath);
-		}
-
-		// 2. 主动清除旧路径可能被框架自动生成的墓碑
-		// Obsidian 的 rename 事件可能先触发 delete 再触发 rename
-		// 如果墓碑中已有 oldPath，说明是重命名而非真正删除，必须清除
-		if (this.localTombstones[oldPath]) {
-			delete this.localTombstones[oldPath];
-			console.log("[S3 Sync] 重命名拦截：清除旧路径墓碑", oldPath);
 		}
 
 		this.triggerDebouncedSync();
@@ -197,19 +195,42 @@ export default class S3SyncPlugin extends Plugin {
 	// ══════════════════════════════════════════════════════════
 
 	private onFileModify(file: TAbstractFile): void {
+		if (this.isSyncing) return; // 忽略同步引擎自己产生的文件 I/O
 		if (!(file instanceof TFile)) return;
 		if (this.isPathExcluded(file.path)) return;
 
-		// 纯同步内存赋值 — 观察者记录落笔时间
-		this.localLedger[file.path] = {
-			lastPenDropTime: Date.now(),
-			isUploaded: false,
-			hash: "",
+		const existingEntry = this.localLedger[file.path];
+		const tombstoneEntry = this.localTombstones[file.path];
+		const existing = existingEntry
+			? normalizeFileState(file.path, existingEntry, this.settings.deviceId)
+			: undefined;
+		const tombstone = tombstoneEntry
+			? normalizeDeletedEntry(file.path, tombstoneEntry, this.settings.deviceId)
+			: undefined;
+
+		// 纯同步内存赋值 — 内容哈希稍后由扫描器补齐，baseVersion 保留最后看到的云端版本
+		const updatedEntry: FileState = {
+			fileId: existing?.fileId ?? tombstone?.fileId ?? file.path,
+			version: existing?.version ?? tombstone?.version ?? 0,
+			baseVersion: existing?.version ?? tombstone?.version ?? 0,
+			contentHash: existing?.contentHash ?? "",
+			mtime: Date.now(),
 			lastModifiedBy: this.settings.deviceId,
+			remoteRevision: existing?.remoteRevision ?? tombstone?.remoteRevision,
+			parentHash: existing?.contentHash ?? tombstone?.contentHash ?? "",
 		};
-		console.log("[S3 Sync] 观察者：落笔记录", file.path, "isUploaded=false");
+		this.localLedger[file.path] = updatedEntry;
+		if (this.localTombstones[file.path]) {
+			delete this.localTombstones[file.path];
+		}
+		console.log("[S3 Sync] 观察者：落笔记录", file.path, "baseVersion", updatedEntry.baseVersion);
 
 		this.triggerDebouncedSync();
+	}
+
+	private onFileCreate(file: TAbstractFile): void {
+		if (this.isSyncing) return; // 忽略同步引擎自己产生的文件 I/O
+		this.onFileModify(file);
 	}
 
 	// ── 文件删除拦截 → 纯同步内存赋值墓碑 ──
@@ -230,6 +251,7 @@ export default class S3SyncPlugin extends Plugin {
 	}
 
 	private onFileDelete(file: TAbstractFile): void {
+		if (this.isSyncing) return; // 忽略同步引擎自己产生的文件 I/O
 		if (!(file instanceof TFile)) return;
 		this.onFileDeleteByPath(file.path);
 		this.triggerDebouncedSync();
@@ -239,29 +261,33 @@ export default class S3SyncPlugin extends Plugin {
 		if (!path.endsWith(".md")) return;
 		if (this.isPathExcluded(path)) return;
 
-		// 纯同步内存赋值 — 绝不 await
-		this.localTombstones[path] = {mtime: Date.now(), deletedBy: this.settings.deviceId};
+		const oldLedgerEntry = this.localLedger[path];
+		const oldEntry = oldLedgerEntry
+			? normalizeFileState(path, oldLedgerEntry, this.settings.deviceId)
+			: undefined;
+		const baseVersion = oldEntry?.version ?? 0;
+		this.localTombstones[path] = createDeletedEntry(
+			path,
+			this.settings.deviceId,
+			baseVersion,
+			oldEntry?.fileId ?? path,
+			oldEntry?.contentHash ?? "",
+			oldEntry?.remoteRevision,
+		);
 		// 同时从账本中移除该文件
 		delete this.localLedger[path];
 		console.log("[S3 Sync] 观察者：记录墓碑", path);
 	}
 
 	// ══════════════════════════════════════════════════════════
-	// 任务三：墓碑垃圾回收 (Tombstone GC)
+	// 墓碑垃圾回收 (Tombstone GC)
 	// ══════════════════════════════════════════════════════════
 
 	public runTombstoneGC(tombstones: Record<string, DeletedEntry>): Record<string, DeletedEntry> {
-		const now = Date.now();
 		const result: Record<string, DeletedEntry> = {};
 
 		for (const [path, entry] of Object.entries(tombstones)) {
-			if (now - entry.mtime < TOMBSTONE_EXPIRY_MS) {
-				// 未过期 → 保留
-				result[path] = entry;
-			} else {
-				// 超过 30 天 → 强制删除
-				console.log("[S3 Sync] 墓碑 GC：清理过期记录", path, "删除于", new Date(entry.mtime).toLocaleString());
-			}
+			result[path] = normalizeDeletedEntry(path, entry, this.settings?.deviceId ?? "");
 		}
 
 		return result;
@@ -319,7 +345,7 @@ export default class S3SyncPlugin extends Plugin {
 	}
 
 	private persistTombstones(): void {
-		// 持久化前执行墓碑 GC
+		// 墓碑长期保留，避免超过固定时间未上线的设备复活旧文件。
 		this.localTombstones = this.runTombstoneGC(this.localTombstones);
 		this.app.saveLocalStorage("s3-sync-tombstones", JSON.stringify(this.localTombstones));
 	}
@@ -361,7 +387,7 @@ export default class S3SyncPlugin extends Plugin {
 	// ── 同步入口 ──
 
 	private async startSync(silent = false): Promise<void> {
-		if (this.syncing) {
+		if (this._syncing) {
 			if (!silent) new Notice("同步正在进行中，请稍候…");
 			return;
 		}
@@ -372,7 +398,7 @@ export default class S3SyncPlugin extends Plugin {
 			return;
 		}
 
-		this.syncing = true;
+		this._syncing = true;
 		this.updateStatusBar("scanning");
 
 		if (!silent) new Notice("S3 同步开始…");
@@ -387,16 +413,18 @@ export default class S3SyncPlugin extends Plugin {
 				this.localLedger,
 			);
 
-			// 同步成功后：用 transferManager 中已更新的 localManifest 回写本地账本
-			this.localLedger = this.transferManager.localManifest;
-			this.persistLedger();
+			const manifestFailed = result.failed.some(item => item.path === "manifest.json");
+			if (!manifestFailed) {
+				// manifest 条件写入成功后，才把本轮同步结果视为本地账本事实。
+				this.localLedger = this.transferManager.localManifest;
+				this.persistLedger();
 
-			// 更新同步时间
-			this.localLastSyncTime = Date.now();
-			this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
-
-			// 清理已处理的墓碑（含 GC）
-			this.persistTombstones();
+				this.localLastSyncTime = Date.now();
+				this.app.saveLocalStorage("s3-sync-last-sync-time", String(this.localLastSyncTime));
+				this.persistTombstones();
+			} else {
+				console.warn("[S3 Sync] manifest 未提交成功，本地账本保持原状，等待下次同步重试");
+			}
 
 			this.updateStatusBar("done");
 
@@ -425,7 +453,8 @@ export default class S3SyncPlugin extends Plugin {
 			if (!silent) new Notice(`同步出错：${msg}`, 8000);
 			this.updateStatusBar("idle");
 		} finally {
-			this.syncing = false;
+			this._syncing = false;
+			this.isSyncing = false;
 		}
 	}
 }

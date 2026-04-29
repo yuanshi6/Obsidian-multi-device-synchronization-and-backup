@@ -1,8 +1,6 @@
-import {S3TransferManager, SyncResult} from "../src/transfer";
+import {S3TransferManager} from "../src/transfer";
 import {FileState, DeletedEntry, SyncManifest} from "../src/scanner";
 import {S3BackupSettings} from "../src/settings";
-
-// ── Mock AWS SDK ──
 
 jest.mock("@aws-sdk/client-s3", () => {
 	const send = jest.fn();
@@ -15,16 +13,42 @@ jest.mock("@aws-sdk/client-s3", () => {
 	};
 });
 
-import {S3Client, PutObjectCommand, GetObjectCommand, DeleteObjectCommand, ListObjectsV2Command} from "@aws-sdk/client-s3";
+const H1 = "a".repeat(64);
+const H2 = "b".repeat(64);
 
-// ── Helpers ──
-
-function fs(lastPenDropTime: number, isUploaded = false, hash = "", lastModifiedBy = "dev1"): FileState {
-	return {lastPenDropTime, isUploaded, hash, lastModifiedBy};
+function fs(
+	version: number,
+	contentHash = H1,
+	baseVersion = version,
+	parentHash = contentHash,
+	lastModifiedBy = "dev1",
+	mtime = version,
+): FileState {
+	return {
+		fileId: "file-id",
+		version,
+		baseVersion,
+		contentHash,
+		mtime,
+		lastModifiedBy,
+		parentHash,
+	};
 }
 
-function tomb(mtime: number, deletedBy = "dev1"): DeletedEntry {
-	return {mtime, deletedBy};
+function dirty(baseVersion: number, contentHash = H2, parentHash = H1): FileState {
+	return fs(baseVersion, contentHash, baseVersion, parentHash);
+}
+
+function tomb(version: number, baseVersion = Math.max(0, version - 1), deletedBy = "dev1"): DeletedEntry {
+	return {
+		mtime: version,
+		deletedBy,
+		version,
+		baseVersion,
+		fileId: "file-id",
+		contentHash: H1,
+		ackedBy: {[deletedBy]: version},
+	};
 }
 
 const testSettings: S3BackupSettings = {
@@ -44,7 +68,7 @@ function createManager(settings = testSettings): S3TransferManager {
 	const mockVault = {
 		adapter: {
 			read: jest.fn().mockResolvedValue("content"),
-			readBinary: jest.fn().mockResolvedValue(new ArrayBuffer(4)),
+			readBinary: jest.fn().mockResolvedValue(new TextEncoder().encode("bin").buffer),
 			write: jest.fn().mockResolvedValue(undefined),
 			writeBinary: jest.fn().mockResolvedValue(undefined),
 			exists: jest.fn().mockResolvedValue(true),
@@ -56,30 +80,17 @@ function createManager(settings = testSettings): S3TransferManager {
 	return new S3TransferManager(mockVault, settings);
 }
 
-// ══════════════════════════════════════════════════════════
-// S3TransferManager — processQueues
-// ══════════════════════════════════════════════════════════
-
 describe("S3TransferManager", () => {
 	let manager: S3TransferManager;
-	let mockSend: jest.Mock;
 
 	beforeEach(() => {
 		jest.clearAllMocks();
 		manager = createManager();
-		// Get the mock send from the S3Client constructor
-		const s3Instances = (S3Client as jest.Mock).mock.results;
-		// The send function is shared across all instances due to closure
-		mockSend = (S3Client as jest.Mock).mock.calls[0] ? (() => {
-			// Re-create to get fresh send
-			const m = createManager();
-			return (m as any).client.send;
-		})() : jest.fn();
 	});
 
 	describe("processQueues — upload", () => {
-		it("uploads files and marks them as isUploaded=true", async () => {
-			const localFiles = {"a.md": fs(100, false)};
+		it("uploads files and records the confirmed next version", async () => {
+			const localFiles = {"a.md": dirty(0, H1, "")};
 			const cloudFiles: Record<string, FileState> = {};
 			const delta = {
 				uploadQueue: ["a.md"],
@@ -90,28 +101,61 @@ describe("S3TransferManager", () => {
 				hashStitched: [],
 			};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
 				lastSyncTime: 0, files: {}, deleted: {},
 			};
 
-			manager.localManifest = {"a.md": fs(100, false)};
+			manager.localManifest = {"a.md": dirty(0, H1, "")};
 
-			// Mock the send to succeed
-			(manager as any).client.send = jest.fn().mockResolvedValue({});
+			const sentCommands: any[] = [];
+			(manager as any).client.send = jest.fn().mockImplementation((cmd: any) => {
+				sentCommands.push(cmd);
+				return Promise.resolve({ETag: `"etag-${cmd.Key}"`});
+			});
 
 			const result = await manager.processQueues(
 				delta, localFiles, cloudFiles, "dev1", "TestDevice", cloudManifest,
 			);
 
 			expect(result.uploaded).toBe(1);
-			expect(manager.localManifest["a.md"].isUploaded).toBe(true);
+			expect(manager.localManifest["a.md"].version).toBe(1);
+			expect(manager.localManifest["a.md"].baseVersion).toBe(1);
+			expect(manager.localManifest["a.md"].parentHash).toBe(H1);
+			expect(sentCommands[0].Metadata["x-amz-meta-content-sha256"]).toBe(H1);
+		});
+
+		it("increments from the current cloud version on upload", async () => {
+			const localFiles = {"a.md": dirty(2, H2, H1)};
+			const cloudFiles = {"a.md": fs(2, H1)};
+			const delta = {
+				uploadQueue: ["a.md"],
+				downloadQueue: [],
+				deleteQueue: [],
+				localDeleteQueue: [],
+				conflictQueue: [],
+				hashStitched: [],
+			};
+			const cloudManifest: SyncManifest = {
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
+				lastSyncTime: 0, files: cloudFiles, deleted: {},
+			};
+
+			manager.localManifest = {"a.md": dirty(2, H2, H1)};
+			(manager as any).client.send = jest.fn().mockResolvedValue({});
+
+			await manager.processQueues(
+				delta, localFiles, cloudFiles, "dev1", "TestDevice", cloudManifest,
+			);
+
+			expect(manager.localManifest["a.md"].version).toBe(3);
+			expect(manager.localManifest["a.md"].baseVersion).toBe(3);
 		});
 	});
 
 	describe("processQueues — download", () => {
-		it("downloads files and sets cloud lastPenDropTime in localManifest", async () => {
-			const localFiles = {"b.md": fs(100, true)};
-			const cloudFiles = {"b.md": fs(200, true, "hash1", "dev2")};
+		it("downloads files and records cloud version as the new local baseVersion", async () => {
+			const localFiles = {"b.md": fs(1, H1)};
+			const cloudFiles = {"b.md": fs(2, H2, 2, H2, "dev2")};
 			const delta = {
 				uploadQueue: [],
 				downloadQueue: ["b.md"],
@@ -121,20 +165,23 @@ describe("S3TransferManager", () => {
 				hashStitched: [],
 			};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
 				lastSyncTime: 0, files: cloudFiles, deleted: {},
 			};
 
-			manager.localManifest = {"b.md": fs(100, true)};
+			manager.localManifest = {"b.md": fs(1, H1)};
 
 			(manager as any).client.send = jest.fn().mockImplementation((cmd: any) => {
 				if (cmd.Key === "manifest.json") return Promise.resolve({});
 				return Promise.resolve({
+					ETag: "\"file-etag\"",
 					Body: {
-						transformToByteArray: () => Promise.resolve(new Uint8Array([116, 101, 115, 116])),
-						transformToString: () => Promise.resolve("test content"),
+						transformToByteArray: () => Promise.resolve(new TextEncoder().encode("downloaded")),
 					},
-					Metadata: {"x-amz-meta-mtime": "200"},
+					Metadata: {
+						"x-amz-meta-mtime": "200",
+						"x-amz-meta-content-sha256": H2,
+					},
 				});
 			});
 
@@ -143,13 +190,14 @@ describe("S3TransferManager", () => {
 			);
 
 			expect(result.downloaded).toBe(1);
-			// Echo defense: localManifest should have cloud's lastPenDropTime
-			expect(manager.localManifest["b.md"].lastPenDropTime).toBe(200);
-			expect(manager.localManifest["b.md"].isUploaded).toBe(true);
+			expect(manager.localManifest["b.md"].version).toBe(2);
+			expect(manager.localManifest["b.md"].baseVersion).toBe(2);
+			expect(manager.localManifest["b.md"].contentHash).toBe(H2);
+			expect(manager.localManifest["b.md"].parentHash).toBe(H2);
 		});
 	});
 
-	describe("processQueues — cloud delete", () => {
+	describe("processQueues — deletes", () => {
 		it("deletes files from cloud", async () => {
 			const delta = {
 				uploadQueue: [],
@@ -160,23 +208,21 @@ describe("S3TransferManager", () => {
 				hashStitched: [],
 			};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
-				lastSyncTime: 0, files: {}, deleted: {},
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
+				lastSyncTime: 0, files: {"c.md": fs(2, H1)}, deleted: {},
 			};
 
 			manager.localManifest = {};
-
 			(manager as any).client.send = jest.fn().mockResolvedValue({});
 
 			const result = await manager.processQueues(
-				delta, {}, {}, "dev1", "TestDevice", cloudManifest,
+				delta, {}, cloudManifest.files, "dev1", "TestDevice", cloudManifest,
 			);
 
 			expect(result.deleted).toBe(1);
+			expect(manager.localManifest["c.md"]).toBeUndefined();
 		});
-	});
 
-	describe("processQueues — local delete", () => {
 		it("deletes local files that exist", async () => {
 			const delta = {
 				uploadQueue: [],
@@ -187,12 +233,11 @@ describe("S3TransferManager", () => {
 				hashStitched: [],
 			};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
-				lastSyncTime: 0, files: {}, deleted: {},
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
+				lastSyncTime: 0, files: {}, deleted: {"d.md": tomb(3, 2, "dev2")},
 			};
 
-			manager.localManifest = {};
-
+			manager.localManifest = {"d.md": fs(2, H1)};
 			(manager as any).client.send = jest.fn().mockResolvedValue({});
 
 			const result = await manager.processQueues(
@@ -200,6 +245,8 @@ describe("S3TransferManager", () => {
 			);
 
 			expect(result.localDeleted).toBe(1);
+			expect(result.localDeletedPaths).toContain("d.md");
+			expect(manager.localManifest["d.md"]).toBeUndefined();
 		});
 
 		it("skips local files that don't exist", async () => {
@@ -212,12 +259,11 @@ describe("S3TransferManager", () => {
 				hashStitched: [],
 			};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
-				lastSyncTime: 0, files: {}, deleted: {},
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
+				lastSyncTime: 0, files: {}, deleted: {"missing.md": tomb(3, 2, "dev2")},
 			};
 
 			manager.localManifest = {};
-
 			(manager as any).client.send = jest.fn().mockResolvedValue({});
 			(manager as any).vault.adapter.exists = jest.fn().mockResolvedValue(false);
 
@@ -230,19 +276,21 @@ describe("S3TransferManager", () => {
 	});
 
 	describe("processQueues — manifest upload", () => {
-		it("uploads manifest with merged deleted entries", async () => {
+		it("uploads manifest with merged deleted entries and no fixed tombstone expiry", async () => {
 			const delta = {
 				uploadQueue: [],
 				downloadQueue: [],
 				deleteQueue: ["del.md"],
-				localDeleteQueue: ["local-del.md"],
+				localDeleteQueue: [],
 				conflictQueue: [],
 				hashStitched: [],
 			};
-			const recentTime = Date.now() - 1000;
+			const ancientTime = Date.now() - 365 * 24 * 60 * 60 * 1000;
+			const cloudFiles = {"del.md": fs(2, H1)};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
-				lastSyncTime: 0, files: {}, deleted: {"old-del.md": tomb(recentTime)},
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
+				lastSyncTime: 0, files: cloudFiles,
+				deleted: {"old-del.md": {...tomb(2, 1), mtime: ancientTime}},
 			};
 
 			manager.localManifest = {};
@@ -254,18 +302,18 @@ describe("S3TransferManager", () => {
 			});
 
 			await manager.processQueues(
-				delta, {}, {}, "dev1", "TestDevice", cloudManifest,
+				delta, {}, cloudFiles, "dev1", "TestDevice", cloudManifest,
 			);
 
-			// Last command should be the manifest upload
 			const manifestCmd = sentCommands[sentCommands.length - 1];
 			expect(manifestCmd.Key).toBe("manifest.json");
+			expect(manifestCmd.IfNoneMatch).toBe("*");
 			const body = JSON.parse(manifestCmd.Body);
 			expect(body.deleted["del.md"]).toBeDefined();
-			expect(body.deleted["local-del.md"]).toBeDefined();
+			expect(body.deleted["del.md"].baseVersion).toBe(2);
 			expect(body.deleted["old-del.md"]).toBeDefined();
 			expect(body.deviceId).toBe("dev1");
-			expect(body.version).toBe("3.0");
+			expect(body.version).toBe("4.0");
 		});
 
 		it("removes deleted entries for uploaded/downloaded files", async () => {
@@ -278,43 +326,31 @@ describe("S3TransferManager", () => {
 				hashStitched: [],
 			};
 			const localFiles = {
-				"re-uploaded.md": fs(100, false),
+				"re-uploaded.md": dirty(0, H1, ""),
 			};
 			const cloudFiles = {
-				"re-downloaded.md": fs(200, true),
+				"re-downloaded.md": fs(2, H2),
 			};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
 				lastSyncTime: 0, files: cloudFiles,
 				deleted: {
-					"re-uploaded.md": tomb(50),
-					"re-downloaded.md": tomb(50),
+					"re-uploaded.md": tomb(1, 0),
+					"re-downloaded.md": tomb(1, 0),
 				},
 			};
 
 			manager.localManifest = {
-				"re-uploaded.md": fs(100, false),
+				"re-uploaded.md": dirty(0, H1, ""),
 			};
-
-			(manager as any).client.send = jest.fn().mockImplementation((cmd: any) => {
-				if (cmd.Key === "manifest.json") return Promise.resolve({});
-				if (cmd.Key === "re-downloaded.md") {
-					return Promise.resolve({
-						Body: {transformToString: () => Promise.resolve("content"), transformToByteArray: () => Promise.resolve(new Uint8Array())},
-						Metadata: {"x-amz-meta-mtime": "200"},
-					});
-				}
-				return Promise.resolve({});
-			});
 
 			const sentCommands: any[] = [];
 			(manager as any).client.send = jest.fn().mockImplementation((cmd: any) => {
 				sentCommands.push(cmd);
-				if (cmd.Key === "manifest.json") return Promise.resolve({});
 				if (cmd.Key === "re-downloaded.md") {
 					return Promise.resolve({
-						Body: {transformToString: () => Promise.resolve("content"), transformToByteArray: () => Promise.resolve(new Uint8Array())},
-						Metadata: {"x-amz-meta-mtime": "200"},
+						Body: {transformToByteArray: () => Promise.resolve(new TextEncoder().encode("content"))},
+						Metadata: {"x-amz-meta-content-sha256": H2},
 					});
 				}
 				return Promise.resolve({});
@@ -330,27 +366,45 @@ describe("S3TransferManager", () => {
 			expect(body.deleted["re-downloaded.md"]).toBeUndefined();
 		});
 
-		it("expires deleted entries older than 30 days", async () => {
-			const thirtyOneDaysAgo = Date.now() - 31 * 24 * 60 * 60 * 1000;
+		it("uses IfMatch when a manifest ETag is known", async () => {
+			(manager as any).manifestETag = "\"manifest-etag\"";
+			(manager as any).manifestExists = true;
+			const sentCommands: any[] = [];
+			(manager as any).client.send = jest.fn().mockImplementation((cmd: any) => {
+				sentCommands.push(cmd);
+				return Promise.resolve({ETag: "\"next-etag\""});
+			});
+
+			await manager.uploadManifest({
+				version: "4.0",
+				deviceId: "dev1",
+				deviceName: "TestDevice",
+				lastSyncTime: 0,
+				files: {},
+				deleted: {},
+			});
+
+			expect(sentCommands[0].IfMatch).toBe("\"manifest-etag\"");
+			expect(sentCommands[0].IfNoneMatch).toBeUndefined();
+			expect((manager as any).manifestETag).toBe("\"next-etag\"");
+		});
+
+		it("preserves cloud state for conflicted paths when writing manifest", async () => {
 			const delta = {
 				uploadQueue: [],
 				downloadQueue: [],
 				deleteQueue: [],
 				localDeleteQueue: [],
-				conflictQueue: [],
+				conflictQueue: ["conflict.md"],
 				hashStitched: [],
 			};
+			const cloudFiles = {"conflict.md": fs(11, H2, 11, H2, "dev2")};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
-				lastSyncTime: 0, files: {},
-				deleted: {
-					"expired.md": tomb(thirtyOneDaysAgo),
-					"recent.md": tomb(Date.now() - 1000),
-				},
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
+				lastSyncTime: 0, files: cloudFiles, deleted: {},
 			};
 
-			manager.localManifest = {};
-
+			manager.localManifest = {"conflict.md": dirty(10, H1, H2)};
 			const sentCommands: any[] = [];
 			(manager as any).client.send = jest.fn().mockImplementation((cmd: any) => {
 				sentCommands.push(cmd);
@@ -358,13 +412,13 @@ describe("S3TransferManager", () => {
 			});
 
 			await manager.processQueues(
-				delta, {}, {}, "dev1", "TestDevice", cloudManifest,
+				delta, {"conflict.md": dirty(10, H1, H2)}, cloudFiles, "dev1", "TestDevice", cloudManifest,
 			);
 
 			const manifestCmd = sentCommands[sentCommands.length - 1];
 			const body = JSON.parse(manifestCmd.Body);
-			expect(body.deleted["expired.md"]).toBeUndefined();
-			expect(body.deleted["recent.md"]).toBeDefined();
+			expect(body.files["conflict.md"].version).toBe(11);
+			expect(body.files["conflict.md"].contentHash).toBe(H2);
 		});
 	});
 
@@ -378,13 +432,13 @@ describe("S3TransferManager", () => {
 				conflictQueue: [],
 				hashStitched: [],
 			};
-			const localFiles = {"fail.md": fs(100, false)};
+			const localFiles = {"fail.md": dirty(0, H1, "")};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
 				lastSyncTime: 0, files: {}, deleted: {},
 			};
 
-			manager.localManifest = {"fail.md": fs(100, false)};
+			manager.localManifest = {"fail.md": dirty(0, H1, "")};
 
 			let callCount = 0;
 			(manager as any).client.send = jest.fn().mockImplementation((cmd: any) => {
@@ -399,6 +453,7 @@ describe("S3TransferManager", () => {
 			);
 
 			expect(result.uploaded).toBe(1);
+			expect(callCount).toBe(3);
 		});
 
 		it("records failure after MAX_RETRIES exhausted", async () => {
@@ -410,13 +465,13 @@ describe("S3TransferManager", () => {
 				conflictQueue: [],
 				hashStitched: [],
 			};
-			const localFiles = {"always-fail.md": fs(100, false)};
+			const localFiles = {"always-fail.md": dirty(0, H1, "")};
 			const cloudManifest: SyncManifest = {
-				version: "3.0", deviceId: "cloud", deviceName: "cloud",
+				version: "4.0", deviceId: "cloud", deviceName: "cloud",
 				lastSyncTime: 0, files: {}, deleted: {},
 			};
 
-			manager.localManifest = {"always-fail.md": fs(100, false)};
+			manager.localManifest = {"always-fail.md": dirty(0, H1, "")};
 
 			(manager as any).client.send = jest.fn().mockImplementation((cmd: any) => {
 				if (cmd.Key === "manifest.json") return Promise.resolve({});
@@ -438,19 +493,15 @@ describe("S3TransferManager", () => {
 			const m = createManager();
 			expect(m.isSyncing).toBe(false);
 
-			// Mock scanner and S3 to hang
 			(m as any).scanner.scanAll = jest.fn().mockImplementation(() => new Promise(() => {}));
 			(m as any).client.send = jest.fn().mockResolvedValue({});
 
-			const firstSync = m.fullSync("dev1", 0);
+			m.fullSync("dev1", 0);
 			expect(m.isSyncing).toBe(true);
 
 			const secondResult = await m.fullSync("dev1", 0);
 			expect(secondResult.uploaded).toBe(0);
 			expect(secondResult.failed).toHaveLength(0);
-
-			// Let the first one finish (it won't because scanAll hangs, but we can force it)
-			// Just verify the lock is working
 		});
 	});
 });

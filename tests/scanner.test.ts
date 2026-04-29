@@ -5,21 +5,51 @@ import {
 	FileState,
 	DeletedEntry,
 	SyncManifest,
+	sha256Hex,
 } from "../src/scanner";
 import {S3BackupSettings} from "../src/settings";
 
-// ── Helpers ──
+const H1 = "a".repeat(64);
+const H2 = "b".repeat(64);
+const H3 = "c".repeat(64);
 
-function fs(lastPenDropTime: number, isUploaded = false, hash = "", lastModifiedBy = "dev1"): FileState {
-	return {lastPenDropTime, isUploaded, hash, lastModifiedBy};
+function fs(
+	version: number,
+	contentHash = H1,
+	baseVersion = version,
+	parentHash = contentHash,
+	lastModifiedBy = "dev1",
+	mtime = version,
+): FileState {
+	return {
+		fileId: "file-id",
+		version,
+		baseVersion,
+		contentHash,
+		mtime,
+		lastModifiedBy,
+		parentHash,
+	};
 }
 
-function tomb(mtime: number, deletedBy = "dev1"): DeletedEntry {
-	return {mtime, deletedBy};
+function dirty(baseVersion: number, contentHash = H2, parentHash = H1): FileState {
+	return fs(baseVersion, contentHash, baseVersion, parentHash);
+}
+
+function tomb(version: number, baseVersion = Math.max(0, version - 1), deletedBy = "dev1"): DeletedEntry {
+	return {
+		mtime: version,
+		deletedBy,
+		version,
+		baseVersion,
+		fileId: "file-id",
+		contentHash: H1,
+		ackedBy: {[deletedBy]: version},
+	};
 }
 
 function manifest(files: Record<string, FileState> = {}, deleted: Record<string, DeletedEntry> = {}): SyncManifest {
-	return {version: "3.0", deviceId: "cloud", deviceName: "cloud", lastSyncTime: Date.now(), files, deleted};
+	return {version: "4.0", deviceId: "cloud", deviceName: "cloud", lastSyncTime: Date.now(), files, deleted};
 }
 
 const defaultSettings: S3BackupSettings = {
@@ -27,10 +57,6 @@ const defaultSettings: S3BackupSettings = {
 	bucketName: "", autoSync: false, syncInterval: 30,
 	excludePatterns: ".obsidian,.trash", deviceId: "dev1", deviceName: "test",
 };
-
-// ══════════════════════════════════════════════════════════
-// normalizeSyncPath
-// ══════════════════════════════════════════════════════════
 
 describe("normalizeSyncPath", () => {
 	it("converts backslashes to forward slashes", () => {
@@ -50,77 +76,78 @@ describe("normalizeSyncPath", () => {
 	});
 });
 
-// ══════════════════════════════════════════════════════════
-// computeSyncDelta — 核心同步 Diff 算法
-// ══════════════════════════════════════════════════════════
-
 describe("computeSyncDelta", () => {
-	// ── 场景 1：仅本地存在 ──
-
 	describe("local-only files", () => {
-		it("uploads new local file (isUploaded=false)", () => {
-			const local = {"notes/a.md": fs(100, false)};
+		it("uploads new local file based on version 0", () => {
+			const local = {"notes/a.md": fs(0, H1, 0, "")};
 			const delta = computeSyncDelta(local, manifest());
 			expect(delta.uploadQueue).toContain("notes/a.md");
 			expect(delta.downloadQueue).toHaveLength(0);
 		});
 
-		it("skips already-uploaded local file (isUploaded=true)", () => {
-			const local = {"notes/a.md": fs(100, true)};
+		it("skips already-versioned local file when cloud has no tombstone", () => {
+			const local = {"notes/a.md": fs(1)};
 			const delta = computeSyncDelta(local, manifest());
 			expect(delta.uploadQueue).toHaveLength(0);
 			expect(delta.downloadQueue).toHaveLength(0);
 		});
 	});
 
-	// ── 场景 2：仅云端存在 ──
-
 	describe("cloud-only files", () => {
 		it("downloads cloud-only file", () => {
-			const cloud = manifest({"notes/b.md": fs(200, true)});
+			const cloud = manifest({"notes/b.md": fs(2, H2)});
 			const delta = computeSyncDelta({}, cloud);
 			expect(delta.downloadQueue).toContain("notes/b.md");
 			expect(delta.uploadQueue).toHaveLength(0);
 		});
 	});
 
-	// ── 场景 3：本地和云端都有 ──
-
-	describe("both local and cloud", () => {
-		it("uploads when local is newer (lastPenDropTime > cloud)", () => {
-			const local = {"notes/a.md": fs(300, false)};
-			const cloud = manifest({"notes/a.md": fs(200, true)});
+	describe("version-chain decisions", () => {
+		it("uploads dirty local content only when local.baseVersion equals cloud.version", () => {
+			const local = {"notes/a.md": dirty(2, H2, H1)};
+			const cloud = manifest({"notes/a.md": fs(2, H1)});
 			const delta = computeSyncDelta(local, cloud);
 			expect(delta.uploadQueue).toContain("notes/a.md");
+			expect(delta.conflictQueue).toHaveLength(0);
+		});
+
+		it("conflicts when dirty local content is based on an older cloud version", () => {
+			const local = {"notes/a.md": dirty(10, H2, H1)};
+			const cloud = manifest({"notes/a.md": fs(11, H3)});
+			const delta = computeSyncDelta(local, cloud);
+			expect(delta.conflictQueue).toContain("notes/a.md");
+			expect(delta.uploadQueue).toHaveLength(0);
 			expect(delta.downloadQueue).toHaveLength(0);
 		});
 
-		it("downloads when cloud is newer (lastPenDropTime > local)", () => {
-			const local = {"notes/a.md": fs(100, true)};
-			const cloud = manifest({"notes/a.md": fs(200, true)});
+		it("downloads when local content is unchanged and cloud version is newer", () => {
+			const local = {"notes/a.md": fs(10, H1, 10, H1, "dev1", 999999)};
+			const cloud = manifest({"notes/a.md": fs(11, H2)});
 			const delta = computeSyncDelta(local, cloud);
 			expect(delta.downloadQueue).toContain("notes/a.md");
 			expect(delta.uploadQueue).toHaveLength(0);
 		});
 
-		it("uploads when timestamps equal but isUploaded=false", () => {
-			const local = {"notes/a.md": fs(200, false)};
-			const cloud = manifest({"notes/a.md": fs(200, true)});
+		it("does not treat a newer local mtime as a reason to upload", () => {
+			const local = {"notes/a.md": fs(10, H1, 10, H1, "dev1", 999999)};
+			const cloud = manifest({"notes/a.md": fs(11, H2, 11, H2, "dev2", 1)});
 			const delta = computeSyncDelta(local, cloud);
-			expect(delta.uploadQueue).toContain("notes/a.md");
+			expect(delta.downloadQueue).toContain("notes/a.md");
+			expect(delta.uploadQueue).toHaveLength(0);
 		});
 
-		it("skips when timestamps equal and isUploaded=true", () => {
-			const local = {"notes/a.md": fs(200, true)};
-			const cloud = manifest({"notes/a.md": fs(200, true)});
+		it("skips when local and cloud are already the same version and hash", () => {
+			const local = {"notes/a.md": fs(2, H1)};
+			const cloud = manifest({"notes/a.md": fs(2, H1)});
 			const delta = computeSyncDelta(local, cloud);
 			expect(delta.uploadQueue).toHaveLength(0);
 			expect(delta.downloadQueue).toHaveLength(0);
+			expect(delta.conflictQueue).toHaveLength(0);
 		});
 
-		it("hash stitches when no ledger entry and hashes match", () => {
-			const local = {"notes/a.md": fs(100, false, "abc123")};
-			const cloud = manifest({"notes/a.md": fs(200, true, "abc123")});
+		it("hash stitches when no ledger entry and SHA-256 hashes match", () => {
+			const local = {"notes/a.md": fs(0, H1, 0, "")};
+			const cloud = manifest({"notes/a.md": fs(2, H1)});
 			const delta = computeSyncDelta(local, cloud, "dev1", {}, {});
 			expect(delta.hashStitched).toContain("notes/a.md");
 			expect(delta.uploadQueue).toHaveLength(0);
@@ -128,85 +155,64 @@ describe("computeSyncDelta", () => {
 		});
 
 		it("does not hash stitch when ledger entry exists", () => {
-			const local = {"notes/a.md": fs(100, false, "abc123")};
-			const cloud = manifest({"notes/a.md": fs(200, true, "abc123")});
-			const ledger = {"notes/a.md": fs(100, false, "abc123")};
+			const local = {"notes/a.md": fs(2, H1)};
+			const cloud = manifest({"notes/a.md": fs(2, H1)});
+			const ledger = {"notes/a.md": fs(2, H1)};
 			const delta = computeSyncDelta(local, cloud, "dev1", {}, ledger);
 			expect(delta.hashStitched).toHaveLength(0);
 		});
-
-		it("does not hash stitch when hashes differ", () => {
-			const local = {"notes/a.md": fs(100, false, "hash1")};
-			const cloud = manifest({"notes/a.md": fs(200, true, "hash2")});
-			const delta = computeSyncDelta(local, cloud, "dev1", {}, {});
-			expect(delta.hashStitched).toHaveLength(0);
-			// cloud is newer → download
-			expect(delta.downloadQueue).toContain("notes/a.md");
-		});
 	});
 
-	// ── 场景 4：墓碑逻辑 ──
-
 	describe("tombstone logic", () => {
-		it("local tomb + cloud tomb → skip (both deleted)", () => {
-			const local = {"notes/a.md": fs(100, true)};
-			const localTombs = {"notes/a.md": tomb(150)};
-			const cloud = manifest({"notes/a.md": fs(100, true)}, {"notes/a.md": tomb(160)});
-			const delta = computeSyncDelta(local, cloud, "dev1", localTombs, {});
+		it("local tomb + cloud tomb skips because both sides are deleted", () => {
+			const localTombs = {"notes/a.md": tomb(3, 2)};
+			const cloud = manifest({}, {"notes/a.md": tomb(3, 2, "dev2")});
+			const delta = computeSyncDelta({}, cloud, "dev1", localTombs, {});
 			expect(delta.uploadQueue).toHaveLength(0);
 			expect(delta.downloadQueue).toHaveLength(0);
 			expect(delta.deleteQueue).toHaveLength(0);
 			expect(delta.localDeleteQueue).toHaveLength(0);
 		});
 
-		it("local tomb + no cloud tomb + cloud exists → delete cloud if tomb >= cloud time", () => {
-			const localTombs = {"notes/a.md": tomb(300)};
-			const cloud = manifest({"notes/a.md": fs(200, true)});
+		it("local tomb deletes cloud only when tombstone baseVersion equals cloud.version", () => {
+			const localTombs = {"notes/a.md": tomb(3, 2)};
+			const cloud = manifest({"notes/a.md": fs(2, H1)});
 			const delta = computeSyncDelta({}, cloud, "dev1", localTombs, {});
 			expect(delta.deleteQueue).toContain("notes/a.md");
-			expect(delta.downloadQueue).toHaveLength(0);
+			expect(delta.conflictQueue).toHaveLength(0);
 		});
 
-		it("local tomb + no cloud tomb + cloud exists → download if cloud is newer", () => {
-			const localTombs = {"notes/a.md": tomb(100)};
-			const cloud = manifest({"notes/a.md": fs(200, true)});
+		it("local tomb conflicts when cloud has advanced", () => {
+			const localTombs = {"notes/a.md": tomb(3, 2)};
+			const cloud = manifest({"notes/a.md": fs(4, H2)});
 			const delta = computeSyncDelta({}, cloud, "dev1", localTombs, {});
-			expect(delta.downloadQueue).toContain("notes/a.md");
+			expect(delta.conflictQueue).toContain("notes/a.md");
 			expect(delta.deleteQueue).toHaveLength(0);
 		});
 
-		it("cloud tomb + local exists → delete local if tomb >= local time", () => {
-			const local = {"notes/a.md": fs(100, true)};
-			const cloud = manifest({}, {"notes/a.md": tomb(200)});
+		it("cloud tomb deletes unchanged local file", () => {
+			const local = {"notes/a.md": fs(2, H1)};
+			const cloud = manifest({}, {"notes/a.md": tomb(3, 2, "dev2")});
 			const delta = computeSyncDelta(local, cloud, "dev1", {}, {});
 			expect(delta.localDeleteQueue).toContain("notes/a.md");
 			expect(delta.uploadQueue).toHaveLength(0);
 		});
 
-		it("cloud tomb + local exists → upload if local is newer", () => {
-			const local = {"notes/a.md": fs(300, false)};
-			const cloud = manifest({}, {"notes/a.md": tomb(200)});
+		it("cloud tomb conflicts with dirty local changes based on an older version", () => {
+			const local = {"notes/a.md": dirty(2, H2, H1)};
+			const cloud = manifest({}, {"notes/a.md": tomb(3, 2, "dev2")});
 			const delta = computeSyncDelta(local, cloud, "dev1", {}, {});
-			expect(delta.uploadQueue).toContain("notes/a.md");
+			expect(delta.conflictQueue).toContain("notes/a.md");
 			expect(delta.localDeleteQueue).toHaveLength(0);
 		});
 
-		it("cloud tomb + no local file → skip", () => {
-			const cloud = manifest({}, {"notes/a.md": tomb(200)});
+		it("cloud tomb + no local file skips", () => {
+			const cloud = manifest({}, {"notes/a.md": tomb(3, 2)});
 			const delta = computeSyncDelta({}, cloud, "dev1", {}, {});
 			expect(delta.localDeleteQueue).toHaveLength(0);
 			expect(delta.uploadQueue).toHaveLength(0);
 		});
-
-		it("local tomb + no cloud tomb + no cloud file → skip", () => {
-			const localTombs = {"notes/a.md": tomb(100)};
-			const delta = computeSyncDelta({}, manifest(), "dev1", localTombs, {});
-			expect(delta.deleteQueue).toHaveLength(0);
-			expect(delta.downloadQueue).toHaveLength(0);
-		});
 	});
-
-	// ── 场景 5：空输入 ──
 
 	describe("empty inputs", () => {
 		it("returns empty delta when both local and cloud are empty", () => {
@@ -220,44 +226,37 @@ describe("computeSyncDelta", () => {
 		});
 
 		it("handles null cloud manifest", () => {
-			const local = {"notes/a.md": fs(100, false)};
+			const local = {"notes/a.md": fs(0, H1, 0, "")};
 			const delta = computeSyncDelta(local, null);
 			expect(delta.uploadQueue).toContain("notes/a.md");
 		});
 	});
 
-	// ── 场景 6：多文件混合 ──
-
 	describe("multiple files mixed", () => {
 		it("correctly categorizes multiple files", () => {
 			const local = {
-				"a.md": fs(100, false),        // local-only, not uploaded → upload
-				"b.md": fs(200, true),         // local-only, uploaded → skip
-				"c.md": fs(300, false),        // both, local newer → upload
-				"e.md": fs(100, true, "h1"),   // both, same hash, no ledger → stitch
+				"a.md": fs(0, H1, 0, ""),
+				"b.md": fs(2, H1),
+				"c.md": dirty(2, H2, H1),
+				"e.md": fs(0, H3, 0, ""),
 			};
 			const cloud = manifest({
-				"c.md": fs(200, true),
-				"d.md": fs(400, true),          // cloud-only → download
-				"e.md": fs(200, true, "h1"),
+				"c.md": fs(2, H1),
+				"d.md": fs(4, H2),
+				"e.md": fs(2, H3),
 			});
 			const delta = computeSyncDelta(local, cloud, "dev1", {}, {});
 			expect(delta.uploadQueue).toContain("a.md");
 			expect(delta.uploadQueue).toContain("c.md");
 			expect(delta.downloadQueue).toContain("d.md");
 			expect(delta.hashStitched).toContain("e.md");
-			// b.md should be skipped entirely
 			expect(delta.uploadQueue).not.toContain("b.md");
 		});
 	});
 });
 
-// ══════════════════════════════════════════════════════════
-// FileScanner
-// ══════════════════════════════════════════════════════════
-
 describe("FileScanner", () => {
-	function mockAdapter(files: Record<string, {mtime: number; size: number}>, folders: string[] = []) {
+	function mockAdapter(files: Record<string, {mtime: number; size: number; content: string}>, folders: string[] = []) {
 		const fileList = Object.keys(files);
 		return {
 			list: jest.fn().mockImplementation((dir: string) => {
@@ -271,37 +270,39 @@ describe("FileScanner", () => {
 				if (!f) return null;
 				return {mtime: f.mtime, size: f.size};
 			}),
+			readBinary: jest.fn().mockImplementation((path: string) => {
+				const f = files[path];
+				return Promise.resolve(new TextEncoder().encode(f?.content ?? "").buffer);
+			}),
 		} as any;
 	}
 
-	it("scans files and returns FileState entries", async () => {
+	it("scans files and returns SHA-256 FileState entries", async () => {
 		const adapter = mockAdapter({
-			"notes/a.md": {mtime: 1000, size: 50},
-			"notes/b.md": {mtime: 2000, size: 100},
+			"notes/a.md": {mtime: 1000, size: 50, content: "alpha"},
+			"notes/b.md": {mtime: 2000, size: 100, content: "beta"},
 		});
 		const scanner = new FileScanner(adapter, defaultSettings);
 		const result = await scanner.scanAll();
 
 		expect(Object.keys(result)).toHaveLength(2);
 		expect(result["notes/a.md"]).toEqual({
-			lastPenDropTime: 1000,
-			isUploaded: false,
-			hash: "50-1000",
+			fileId: "notes/a.md",
+			version: 0,
+			baseVersion: 0,
+			contentHash: await sha256Hex(new TextEncoder().encode("alpha")),
+			mtime: 1000,
 			lastModifiedBy: "dev1",
+			parentHash: "",
 		});
-		expect(result["notes/b.md"]).toEqual({
-			lastPenDropTime: 2000,
-			isUploaded: false,
-			hash: "100-2000",
-			lastModifiedBy: "dev1",
-		});
+		expect(result["notes/b.md"]?.contentHash).toBe(await sha256Hex(new TextEncoder().encode("beta")));
 	});
 
 	it("excludes files matching exclude patterns", async () => {
 		const adapter = mockAdapter({
-			".obsidian/config": {mtime: 1000, size: 10},
-			".trash/deleted.md": {mtime: 2000, size: 20},
-			"notes/good.md": {mtime: 3000, size: 30},
+			".obsidian/config": {mtime: 1000, size: 10, content: "config"},
+			".trash/deleted.md": {mtime: 2000, size: 20, content: "trash"},
+			"notes/good.md": {mtime: 3000, size: 30, content: "good"},
 		});
 		const scanner = new FileScanner(adapter, defaultSettings);
 		const result = await scanner.scanAll();
@@ -312,9 +313,9 @@ describe("FileScanner", () => {
 
 	it("excludes system files (.DS_Store, Thumbs.db)", async () => {
 		const adapter = mockAdapter({
-			".DS_Store": {mtime: 1000, size: 6},
-			"Thumbs.db": {mtime: 2000, size: 8},
-			"notes/real.md": {mtime: 3000, size: 30},
+			".DS_Store": {mtime: 1000, size: 6, content: "noise"},
+			"Thumbs.db": {mtime: 2000, size: 8, content: "noise"},
+			"notes/real.md": {mtime: 3000, size: 30, content: "real"},
 		});
 		const scanner = new FileScanner(adapter, defaultSettings);
 		const result = await scanner.scanAll();
@@ -325,7 +326,7 @@ describe("FileScanner", () => {
 
 	it("skips files with null mtime", async () => {
 		const adapter = mockAdapter({
-			"notes/ok.md": {mtime: 1000, size: 10},
+			"notes/ok.md": {mtime: 1000, size: 10, content: "ok"},
 		});
 		adapter.stat.mockImplementation((path: string) => {
 			if (path === "notes/ok.md") return {mtime: 1000, size: 10};
@@ -351,7 +352,7 @@ describe("FileScanner", () => {
 
 	it("normalizes paths with backslashes", async () => {
 		const adapter = mockAdapter({
-			"folder\\sub\\file.md": {mtime: 1000, size: 10},
+			"folder\\sub\\file.md": {mtime: 1000, size: 10, content: "file"},
 		});
 		adapter.list.mockResolvedValue({
 			files: ["folder\\sub\\file.md"],
@@ -360,7 +361,6 @@ describe("FileScanner", () => {
 		const scanner = new FileScanner(adapter, defaultSettings);
 		const result = await scanner.scanAll();
 
-		// The scanner normalizes the path
 		expect(result["folder/sub/file.md"]).toBeDefined();
 	});
 
@@ -370,9 +370,9 @@ describe("FileScanner", () => {
 			excludePatterns: "*.tmp,*.bak",
 		};
 		const adapter = mockAdapter({
-			"notes/a.tmp": {mtime: 1000, size: 10},
-			"notes/b.bak": {mtime: 2000, size: 20},
-			"notes/c.md": {mtime: 3000, size: 30},
+			"notes/a.tmp": {mtime: 1000, size: 10, content: "tmp"},
+			"notes/b.bak": {mtime: 2000, size: 20, content: "bak"},
+			"notes/c.md": {mtime: 3000, size: 30, content: "md"},
 		});
 		const scanner = new FileScanner(adapter, settings);
 		const result = await scanner.scanAll();
