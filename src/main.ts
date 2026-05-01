@@ -258,8 +258,7 @@ export default class S3SyncPlugin extends Plugin {
 	}
 
 	private onFileDeleteByPath(path: string): void {
-		if (!path.endsWith(".md")) return;
-		if (this.isPathExcluded(path)) return;
+		if (!this.isSyncTargetPath(path)) return;
 
 		const oldLedgerEntry = this.localLedger[path];
 		const oldEntry = oldLedgerEntry
@@ -274,9 +273,19 @@ export default class S3SyncPlugin extends Plugin {
 			oldEntry?.contentHash ?? "",
 			oldEntry?.remoteRevision,
 		);
-		// 同时从账本中移除该文件
 		delete this.localLedger[path];
-		console.log("[S3 Sync] 观察者：记录墓碑", path);
+		console.log("[S3 Sync] 观察者：记录墓碑", path, "baseVersion", baseVersion);
+
+		// 立即持久化，不等防抖 — Android 后台时至少保证删除事实落盘
+		this.persistLedger();
+		this.persistTombstones();
+	}
+
+	private isSyncTargetPath(path: string): boolean {
+		if (this.isPathExcluded(path)) return false;
+		const name = path.split("/").pop() ?? "";
+		if (name === ".DS_Store" || name === "Thumbs.db" || name === "desktop.ini") return false;
+		return true;
 	}
 
 	// ══════════════════════════════════════════════════════════
@@ -399,6 +408,7 @@ export default class S3SyncPlugin extends Plugin {
 		}
 
 		this._syncing = true;
+		this.isSyncing = true;
 		this.updateStatusBar("scanning");
 
 		if (!silent) new Notice("S3 同步开始…");

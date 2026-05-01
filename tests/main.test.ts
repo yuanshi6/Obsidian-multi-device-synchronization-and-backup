@@ -2,6 +2,8 @@ import S3SyncPlugin from "../src/main";
 import {DeletedEntry, FileState} from "../src/scanner";
 import {TFile} from "obsidian";
 
+// ── Mock obsidian ──
+
 jest.mock("obsidian", () => {
 	const TFileMock = class {
 		path: string;
@@ -48,8 +50,14 @@ jest.mock("obsidian", () => {
 	};
 });
 
+// ── Helpers ──
+
 const H1 = "a".repeat(64);
 const H2 = "b".repeat(64);
+
+function fs(version: number, contentHash = H1, baseVersion = version, parentHash = contentHash, lastModifiedBy = "dev1", mtime = version): FileState {
+	return {fileId: "file-id", version, baseVersion, contentHash, mtime, lastModifiedBy, parentHash};
+}
 
 function tomb(version: number, baseVersion = Math.max(0, version - 1), deletedBy = "dev1"): DeletedEntry {
 	return {
@@ -63,17 +71,9 @@ function tomb(version: number, baseVersion = Math.max(0, version - 1), deletedBy
 	};
 }
 
-function fs(version: number, contentHash = H1, baseVersion = version, parentHash = contentHash, lastModifiedBy = "dev1"): FileState {
-	return {
-		fileId: "file-id",
-		version,
-		baseVersion,
-		contentHash,
-		mtime: version,
-		lastModifiedBy,
-		parentHash,
-	};
-}
+// ══════════════════════════════════════════════════════════
+// Tombstone GC
+// ══════════════════════════════════════════════════════════
 
 describe("S3SyncPlugin — Tombstone GC", () => {
 	it("keeps tombstones older than 30 days", () => {
@@ -111,6 +111,10 @@ describe("S3SyncPlugin — Tombstone GC", () => {
 	});
 });
 
+// ══════════════════════════════════════════════════════════
+// Rename interceptor logic
+// ══════════════════════════════════════════════════════════
+
 describe("Rename interceptor logic", () => {
 	it("transfers ledger entry from old path to new path and creates old-path tombstone", () => {
 		const plugin = new (S3SyncPlugin as any)();
@@ -145,6 +149,10 @@ describe("Rename interceptor logic", () => {
 	});
 });
 
+// ══════════════════════════════════════════════════════════
+// Delete interceptor logic — 所有同步目标文件类型都立碑
+// ══════════════════════════════════════════════════════════
+
 describe("Delete interceptor logic", () => {
 	it("creates versioned tombstone for .md file deletion", () => {
 		const plugin = new (S3SyncPlugin as any)();
@@ -153,6 +161,7 @@ describe("Delete interceptor logic", () => {
 			"notes/a.md": fs(10, H1),
 		};
 		plugin.localTombstones = {};
+		plugin.isSyncing = false;
 
 		const mockFile = new TFile("notes/a.md");
 		plugin.onFileDelete(mockFile);
@@ -163,17 +172,82 @@ describe("Delete interceptor logic", () => {
 		expect(plugin.localLedger["notes/a.md"]).toBeUndefined();
 	});
 
-	it("ignores non-.md file deletion", () => {
+	it("creates tombstone for .canvas file deletion", () => {
 		const plugin = new (S3SyncPlugin as any)();
 		plugin.settings = {deviceId: "dev1", excludePatterns: ""};
+		plugin.localLedger = {
+			"未命名.canvas": fs(3, H1),
+		};
 		plugin.localTombstones = {};
+		plugin.isSyncing = false;
+
+		const mockFile = new TFile("未命名.canvas");
+		plugin.onFileDelete(mockFile);
+
+		expect(plugin.localTombstones["未命名.canvas"]).toBeDefined();
+		expect(plugin.localTombstones["未命名.canvas"].baseVersion).toBe(3);
+		expect(plugin.localLedger["未命名.canvas"]).toBeUndefined();
+	});
+
+	it("creates tombstone for synced attachment deletion", () => {
+		const plugin = new (S3SyncPlugin as any)();
+		plugin.settings = {deviceId: "dev1", excludePatterns: ""};
+		plugin.localLedger = {
+			"images/photo.png": fs(2, H1),
+		};
+		plugin.localTombstones = {};
+		plugin.isSyncing = false;
 
 		const mockFile = new TFile("images/photo.png");
 		plugin.onFileDelete(mockFile);
 
-		expect(plugin.localTombstones["images/photo.png"]).toBeUndefined();
+		expect(plugin.localTombstones["images/photo.png"]).toBeDefined();
+		expect(plugin.localTombstones["images/photo.png"].baseVersion).toBe(2);
+		expect(plugin.localLedger["images/photo.png"]).toBeUndefined();
+	});
+
+	it("does not create tombstone for excluded paths", () => {
+		const plugin = new (S3SyncPlugin as any)();
+		plugin.settings = {deviceId: "dev1", excludePatterns: ".trash,.obsidian"};
+		plugin.localLedger = {
+			".trash/deleted.canvas": fs(2, H1),
+		};
+		plugin.localTombstones = {};
+
+		const mockFile = new TFile(".trash/deleted.canvas");
+		plugin.onFileDelete(mockFile);
+
+		expect(plugin.localTombstones[".trash/deleted.canvas"]).toBeUndefined();
+	});
+
+	it("does not create tombstone for system files", () => {
+		const plugin = new (S3SyncPlugin as any)();
+		plugin.settings = {deviceId: "dev1", excludePatterns: ""};
+		plugin.localTombstones = {};
+
+		const mockFile = new TFile(".DS_Store");
+		plugin.onFileDelete(mockFile);
+
+		expect(plugin.localTombstones[".DS_Store"]).toBeUndefined();
+	});
+
+	it("creates tombstone with baseVersion=0 when no ledger entry exists", () => {
+		const plugin = new (S3SyncPlugin as any)();
+		plugin.settings = {deviceId: "dev1", excludePatterns: ""};
+		plugin.localLedger = {};
+		plugin.localTombstones = {};
+
+		const mockFile = new TFile("notes/orphan.canvas");
+		plugin.onFileDelete(mockFile);
+
+		expect(plugin.localTombstones["notes/orphan.canvas"]).toBeDefined();
+		expect(plugin.localTombstones["notes/orphan.canvas"].baseVersion).toBe(0);
 	});
 });
+
+// ══════════════════════════════════════════════════════════
+// Modify interceptor logic
+// ══════════════════════════════════════════════════════════
 
 describe("Modify interceptor logic", () => {
 	it("records modification while preserving the last known base version", () => {
@@ -206,6 +280,10 @@ describe("Modify interceptor logic", () => {
 		expect(plugin.localTombstones["notes/a.md"]).toBeUndefined();
 	});
 });
+
+// ══════════════════════════════════════════════════════════
+// Sync-Lock: Observer ignores events during sync
+// ══════════════════════════════════════════════════════════
 
 describe("Sync-Lock: Observer ignores events during sync", () => {
 	it("onFileModify skips when isSyncing=true", () => {
@@ -259,6 +337,10 @@ describe("Sync-Lock: Observer ignores events during sync", () => {
 		expect(plugin.localLedger["notes/a.md"].baseVersion).toBe(0);
 	});
 });
+
+// ══════════════════════════════════════════════════════════
+// Orphan cleanup: tombstone generation for local deletes
+// ══════════════════════════════════════════════════════════
 
 describe("Orphan cleanup: tombstone generation for local deletes", () => {
 	it("localDeletedPaths are populated in SyncResult", async () => {
