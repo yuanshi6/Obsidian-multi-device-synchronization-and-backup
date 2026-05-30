@@ -1,8 +1,63 @@
-/*
+/* S3 Sync Conflict Resolution Modal Premium Styles */
 
-This CSS file will be included with your plugin, and
-available in the app when your plugin is enabled.
+.s3-sync-conflict-info {
+	display: flex;
+	gap: 16px;
+	margin: 20px 0;
+}
 
-If your plugin does not need CSS, delete this file.
+@media (max-width: 600px) {
+	.s3-sync-conflict-info {
+		flex-direction: column;
+	}
+}
 
-*/
+.s3-sync-conflict-side {
+	flex: 1;
+	padding: 16px;
+	border: 1px solid var(--background-modifier-border);
+	border-radius: 8px;
+	background-color: var(--background-secondary);
+	box-shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
+	transition: border-color 0.2s, transform 0.2s, box-shadow 0.2s;
+}
+
+.s3-sync-conflict-side:hover {
+	border-color: var(--interactive-accent);
+	transform: translateY(-2px);
+	box-shadow: 0 6px 12px rgba(0, 0, 0, 0.1);
+}
+
+.s3-sync-conflict-side strong {
+	display: block;
+	font-size: 1.1em;
+	margin-bottom: 8px;
+	color: var(--interactive-accent);
+}
+
+.s3-sync-conflict-side div {
+	margin-top: 6px;
+	font-size: 0.9em;
+	color: var(--text-muted);
+}
+
+.s3-sync-conflict-buttons {
+	display: flex;
+	justify-content: flex-end;
+	gap: 12px;
+	margin-top: 24px;
+}
+
+.s3-sync-conflict-buttons button {
+	padding: 8px 16px;
+	font-weight: 500;
+	transition: background-color 0.2s, transform 0.1s;
+}
+
+.s3-sync-conflict-buttons button:hover {
+	transform: translateY(-1px);
+}
+
+.s3-sync-conflict-buttons button:active {
+	transform: translateY(0);
+}

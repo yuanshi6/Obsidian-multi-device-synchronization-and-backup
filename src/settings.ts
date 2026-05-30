@@ -13,6 +13,10 @@ export interface S3BackupSettings {
 	excludePatterns: string;
 	deviceId: string;
 	deviceName: string;
+	forcePathStyle: boolean;
+	storagePrefix: string;
+	enableConditionalWrite: boolean;
+	enableOrphanCleanup: boolean;
 }
 
 export const DEFAULT_SETTINGS: S3BackupSettings = {
@@ -26,6 +30,10 @@ export const DEFAULT_SETTINGS: S3BackupSettings = {
 	excludePatterns: ".obsidian,.trash",
 	deviceId: "",
 	deviceName: "未命名设备",
+	forcePathStyle: false,
+	storagePrefix: "_obsidian-sync/",
+	enableConditionalWrite: true,
+	enableOrphanCleanup: false,
 };
 
 export class S3SyncSettingTab extends PluginSettingTab {
@@ -113,6 +121,27 @@ export class S3SyncSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
+		new Setting(containerEl)
+			.setName("存储前缀 (Storage Prefix)")
+			.setDesc("控制文件和同步对象存储的 S3 前缀路径，建议保持默认值以隔离数据")
+			.addText(text => text
+				.setPlaceholder("_obsidian-sync/")
+				.setValue(this.plugin.settings.storagePrefix)
+				.onChange(async (value) => {
+					this.plugin.settings.storagePrefix = value;
+					await this.plugin.saveSettings();
+				}));
+
+		new Setting(containerEl)
+			.setName("强制使用路径风格 (Force Path Style)")
+			.setDesc("对于 MinIO 或某些特定 S3 服务，强制将桶名放在 URL 路径中（如 http://endpoint/bucket）")
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.forcePathStyle)
+				.onChange(async (value) => {
+					this.plugin.settings.forcePathStyle = value;
+					await this.plugin.saveSettings();
+				}));
+
 		// ── 设备身份 ──
 		containerEl.createEl("h3", {text: "设备身份"});
 
@@ -178,45 +207,79 @@ export class S3SyncSettingTab extends PluginSettingTab {
 					await this.plugin.saveSettings();
 				}));
 
-		// ── 测试与调试 ──
-		containerEl.createEl("h3", {text: "测试与调试"});
+		new Setting(containerEl)
+			.setName("启用条件写入 (Conditional Write)")
+			.setDesc("利用 S3 的 ETag / IfMatch 特性，防止多设备同时上传 manifest 时发生相互覆盖")
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableConditionalWrite)
+				.onChange(async (value) => {
+					this.plugin.settings.enableConditionalWrite = value;
+					await this.plugin.saveSettings();
+				}));
 
 		new Setting(containerEl)
-			.setName("执行全面同步与清理测试")
-			.setDesc("此操作将获取云端列表、清理未同步的孤儿文件，并执行完整的增量同步。请务必打开开发者控制台 (Ctrl+Shift+I) 查看详细结构化日志。")
-			.addButton(btn => {
-				btn.setButtonText("🚀 运行测试")
-					.setCta()
-					.onClick(async () => {
-						btn.setDisabled(true);
-						btn.setButtonText("⏳ 正在测试...");
-						new Notice("开始执行 S3 同步测试，请盯紧控制台！");
+			.setName("允许手动清理孤儿文件")
+			.setDesc("允许维护按钮扫描插件专属对象前缀并清理超过 24 小时未被 manifest 引用的对象。默认关闭。")
+			.addToggle(toggle => toggle
+				.setValue(this.plugin.settings.enableOrphanCleanup)
+				.onChange(async (value) => {
+					this.plugin.settings.enableOrphanCleanup = value;
+					await this.plugin.saveSettings();
+				}));
 
-						try {
-							const {S3TransferManager} = await import("./transfer");
-							const manager = new S3TransferManager(this.app.vault, this.plugin.settings);
-							
-							const result = await manager.fullSync(this.plugin.settings.deviceId, 0, undefined, {}, {});
+		// ── 手动操作 ──
+		containerEl.createEl("h3", {text: "手动操作与维护"});
 
-							const lines: string[] = [];
-							if (result.uploaded > 0) lines.push(`上传 ${result.uploaded}`);
-							if (result.downloaded > 0) lines.push(`下载 ${result.downloaded}`);
-							if (result.deleted > 0) lines.push(`删除 ${result.deleted}`);
-								if (result.localDeleted > 0) lines.push(`本地删除 ${result.localDeleted}`);
-							if (result.orphanCleaned > 0) lines.push(`清理孤儿 ${result.orphanCleaned}`);
-							if (result.failed.length > 0) lines.push(`失败 ${result.failed.length}`);
+		new Setting(containerEl)
+			.setName("执行完整同步 (Manual Full Sync)")
+			.setDesc("立即触发一次完整的双向增量同步（使用真实的本地账本与墓碑状态）")
+			.addButton(btn => btn
+				.setButtonText("🔄 立即同步")
+				.setCta()
+				.onClick(async () => {
+					btn.setDisabled(true);
+					new Notice("手动同步开始...");
+					try {
+						await (this.plugin as any).startSync(false);
+					} catch (err: unknown) {
+						const msg = err instanceof Error ? err.message : String(err);
+						new Notice(`同步失败: ${msg}`);
+					} finally {
+						btn.setDisabled(false);
+					}
+				}));
 
-							new Notice(`✅ 测试与同步圆满完成！${lines.length > 0 ? " " + lines.join("，") : ""}`);
-						} catch (err: unknown) {
-							const msg = err instanceof Error ? err.message : String(err);
-							console.error("[S3 Sync] 测试失败：", err);
-							new Notice(`❌ 测试失败：${msg}`, 8000);
-						} finally {
-							btn.setDisabled(false);
-							btn.setButtonText("🚀 运行测试");
-						}
-					});
-			});
+		new Setting(containerEl)
+			.setName("清理云端孤儿文件 (Clean Orphan Files)")
+			.setDesc("扫描插件专属前缀目录（objects/），清理所有不在 manifest.json 中且存在超过 24 小时的多余对象文件。此操作安全且不触碰其他目录。")
+			.addButton(btn => btn
+				.setButtonText("🗑️ 清理孤儿文件")
+				.setClass("mod-warning")
+				.onClick(async () => {
+					if (!this.plugin.settings.enableOrphanCleanup) {
+						new Notice("请先启用“允许手动清理孤儿文件”，再执行清理。", 8000);
+						return;
+					}
+					if (!confirm("确定要清理云端孤儿文件吗？这会列出所有前缀对象并删除未被 manifest 引用的旧文件（超过 24 小时）。")) {
+						return;
+					}
+					btn.setDisabled(true);
+					btn.setButtonText("⏳ 正在清理...");
+					new Notice("正在连接 S3 清理孤儿文件...");
+					try {
+						const {S3TransferManager} = await import("./transfer");
+						const manager = new S3TransferManager(this.app.vault, this.plugin.settings);
+						const cloudManifest = await manager.fetchCloudManifest();
+						const count = await manager.cleanOrphanFiles(cloudManifest);
+						new Notice(`✅ 成功清理了 ${count} 个云端孤儿文件`);
+					} catch (err: unknown) {
+						const msg = err instanceof Error ? err.message : String(err);
+						new Notice(`❌ 清理失败: ${msg}`, 8000);
+					} finally {
+						btn.setDisabled(false);
+						btn.setButtonText("🗑️ 清理孤儿文件");
+					}
+				}));
 	}
 
 	private cleanEndpoint(endpoint: string, bucketName: string): string {
@@ -285,7 +348,7 @@ export class S3SyncSettingTab extends PluginSettingTab {
 				},
 				endpoint: endpoint,
 				region: region || "us-east-1",
-				forcePathStyle: false,
+				forcePathStyle: this.plugin.settings.forcePathStyle,
 			});
 
 			console.log("[S3 Sync] 测试连接 — 发送 ListObjectsV2Command (MaxKeys:1)…");

@@ -9,6 +9,7 @@ export class ConflictModal extends Modal {
 	private readonly localMtime: number;
 	private readonly cloudMtime: number;
 	private readonly onResolve: (resolution: ConflictResolution) => void;
+	private resolved = false;
 
 	constructor(
 		app: App,
@@ -53,24 +54,33 @@ export class ConflictModal extends Modal {
 
 		const localBtn = btnContainer.createEl("button", {text: "以本地为准"});
 		localBtn.addEventListener("click", () => {
-			this.onResolve("local");
+			this.resolve("local");
 			this.close();
 		});
 
 		const cloudBtn = btnContainer.createEl("button", {text: "以云端为准"});
 		cloudBtn.addEventListener("click", () => {
-			this.onResolve("cloud");
+			this.resolve("cloud");
 			this.close();
 		});
 
 		const bothBtn = btnContainer.createEl("button", {text: "保留双份副本"});
 		bothBtn.addEventListener("click", () => {
-			this.onResolve("both");
+			this.resolve("both");
 			this.close();
 		});
 	}
 
 	onClose(): void {
+		if (!this.resolved) {
+			this.resolve("both");
+		}
 		this.contentEl.empty();
+	}
+
+	private resolve(resolution: ConflictResolution): void {
+		if (this.resolved) return;
+		this.resolved = true;
+		this.onResolve(resolution);
 	}
 }

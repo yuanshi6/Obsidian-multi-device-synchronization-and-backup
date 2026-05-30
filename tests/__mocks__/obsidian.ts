@@ -1,4 +1,16 @@
 // Mock for Obsidian module — 只导出测试所需的最小接口
+export const Platform = {
+	isDesktop: true,
+	isMobile: false,
+	isDesktopApp: true,
+	isMobileApp: false,
+	isLinux: false,
+	isMacOS: false,
+	isWindows: false,
+	isAndroid: false,
+	isIos: false,
+};
+
 export class Notice {
 	constructor(public message: string, public timeout?: number) {}
 }

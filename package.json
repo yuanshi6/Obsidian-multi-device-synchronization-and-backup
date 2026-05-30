@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-sample-plugin",
-	"version": "1.0.0",
-	"description": "This is a sample plugin for Obsidian (https://obsidian.md)",
+	"name": "obsidian-s3-manifest-sync",
+	"version": "2.0.0",
+	"description": "Manifest-based S3/COS sync plugin for Obsidian",
 	"main": "main.js",
 	"type": "module",
 	"scripts": {

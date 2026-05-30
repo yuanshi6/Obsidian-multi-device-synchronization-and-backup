@@ -15,6 +15,48 @@ function isSystemFile(path: string): boolean {
 	return SYSTEM_FILE_NAMES.has(fileName);
 }
 
+export function normalizeStoragePrefix(prefix: string | undefined): string {
+	let normalized = (prefix || "_obsidian-sync/").trim();
+	if (normalized && !normalized.endsWith("/")) {
+		normalized += "/";
+	}
+	return normalizeSyncPath(normalized);
+}
+
+function buildExcludeRegex(patterns: string): RegExp | null {
+	const trimmed = patterns.split(",")
+		.map(p => p.trim())
+		.filter(p => p.length > 0);
+	if (trimmed.length === 0) return null;
+
+	const parts = trimmed.map(p => {
+		const escaped = p
+			.replace(/[.+^${}()|[\]\\]/g, "\\$&")
+			.replace(/\*/g, ".*")
+			.replace(/\?/g, ".");
+		return `(?:^|/)${escaped}(?:/|$)`;
+	});
+	return new RegExp(parts.join("|"));
+}
+
+export function isSyncTargetPath(path: string, settings: Pick<S3BackupSettings, "excludePatterns" | "storagePrefix">): boolean {
+	const normalized = normalizeSyncPath(path);
+	if (!normalized || isSystemFile(normalized)) return false;
+	if (normalized === "manifest.json") return false;
+
+	const configuredPrefix = normalizeStoragePrefix(settings.storagePrefix);
+	if (configuredPrefix && (normalized.startsWith(configuredPrefix) || normalized.includes("/" + configuredPrefix))) {
+		return false;
+	}
+	const defaultPrefix = "_obsidian-sync/";
+	if (normalized.startsWith(defaultPrefix) || normalized.includes("/" + defaultPrefix)) {
+		return false;
+	}
+
+	const excludeRegex = buildExcludeRegex(settings.excludePatterns || "");
+	return !excludeRegex || !excludeRegex.test(normalized);
+}
+
 // ── 版本链模型：FileState ──
 
 export interface FileState {
@@ -27,6 +69,7 @@ export interface FileState {
 	remoteRevision?: string; // S3 ETag/generation 等远端修订号
 	parentHash?: string;     // baseVersion 对应的内容哈希
 	deleted?: boolean;
+	objectKey?: string;      // 内容寻址存储的 S3 对象 key
 
 	// Legacy fields accepted during migration only. New code must not decide by them.
 	lastPenDropTime?: number;
@@ -63,6 +106,7 @@ export interface SyncDelta {
 	deleteQueue: string[];       // 删除云端文件（本地已删除）
 	localDeleteQueue: string[];  // 删除本地文件（云端已删除）
 	conflictQueue: string[];
+	publishTombstoneQueue?: string[]; // 发布仅本地知道的删除事实到 manifest
 	// 任务四：哈希缝合 — 同名同 Hash 文件无缝编入账本
 	hashStitched: string[];     // 无需传输，直接编入本地账本的路径
 }
@@ -113,6 +157,7 @@ export function normalizeFileState(path: string, raw: Partial<FileState>, fallba
 		remoteRevision: typeof raw.remoteRevision === "string" ? raw.remoteRevision : undefined,
 		parentHash,
 		deleted: raw.deleted === true,
+		objectKey: typeof raw.objectKey === "string" ? raw.objectKey : undefined,
 	};
 }
 
@@ -157,6 +202,7 @@ export function createSyncedFileState(path: string, state: FileState, remoteRevi
 		lastModifiedBy: state.lastModifiedBy,
 		remoteRevision: remoteRevision ?? state.remoteRevision,
 		parentHash: state.contentHash,
+		objectKey: state.objectKey,
 	};
 }
 
@@ -209,37 +255,48 @@ export class FileScanner {
 	private adapter: DataAdapter;
 	private excludeRegex: RegExp | null;
 	private deviceId: string;
+	private storagePrefix: string;
 
 	constructor(adapter: DataAdapter, settings: S3BackupSettings) {
 		this.adapter = adapter;
 		this.deviceId = settings.deviceId;
-		this.excludeRegex = this.buildExcludeRegex(settings.excludePatterns);
-	}
-
-	private buildExcludeRegex(patterns: string): RegExp | null {
-		const trimmed = patterns.split(",")
-			.map(p => p.trim())
-			.filter(p => p.length > 0);
-		if (trimmed.length === 0) return null;
-
-		const parts = trimmed.map(p => {
-			const escaped = p
-				.replace(/[.+^${}()|[\]\\]/g, "\\$&")
-				.replace(/\*/g, ".*")
-				.replace(/\?/g, ".");
-			return `(?:^|/)${escaped}(?:/|$)`;
-		});
-		return new RegExp(parts.join("|"));
+		this.excludeRegex = buildExcludeRegex(settings.excludePatterns);
+		this.storagePrefix = normalizeStoragePrefix(settings.storagePrefix);
 	}
 
 	private isExcluded(path: string): boolean {
+		const normalized = normalizeSyncPath(path);
+		if (normalized === "manifest.json") return true;
+
+		if (this.storagePrefix && (normalized.startsWith(this.storagePrefix) || normalized.includes("/" + this.storagePrefix))) return true;
+		if (normalized.startsWith("_obsidian-sync/") || normalized.includes("/_obsidian-sync/")) return true;
+
 		if (!this.excludeRegex) return false;
-		return this.excludeRegex.test(path);
+		return this.excludeRegex.test(normalized);
 	}
 
 	async scanAll(): Promise<Record<string, FileState>> {
 		const result: Record<string, FileState> = {};
 		await this.walk("", result);
+		return result;
+	}
+
+	async scanPaths(paths: string[]): Promise<Record<string, FileState>> {
+		const result: Record<string, FileState> = {};
+		for (const path of paths) {
+			if (this.isExcluded(path) || isSystemFile(path)) continue;
+			try {
+				const stat = await this.adapter.stat(path);
+				if (stat && stat.mtime != null) {
+					const normalized = normalizeSyncPath(path);
+					const bytes = new Uint8Array(await this.adapter.readBinary(path));
+					const contentHash = await sha256Hex(bytes);
+					result[normalized] = createLocalFileState(normalized, contentHash, stat.mtime, this.deviceId);
+				}
+			} catch (err) {
+				console.warn("[S3 Sync] scanPaths: 无法读取文件", path, err);
+			}
+		}
 		return result;
 	}
 
@@ -281,6 +338,7 @@ export function computeSyncDelta(
 	const localDeleteQueue: string[] = [];
 	const conflictQueue: string[] = [];
 	const hashStitched: string[] = [];
+	const publishTombstoneQueue: string[] = [];
 
 	const cloudFiles = cloudManifest?.files ?? {};
 	const cloudDeleted = cloudManifest?.deleted ?? {};
@@ -318,6 +376,8 @@ export function computeSyncDelta(
 				} else {
 					conflictQueue.push(path);
 				}
+			} else {
+				publishTombstoneQueue.push(path);
 			}
 			continue;
 		}
@@ -342,10 +402,8 @@ export function computeSyncDelta(
 		// ── 无墓碑：版本链判定 ──
 
 		if (normalizedLocal && !normalizedCloud) {
-			// 仅本地存在
-			if (isLocalDirty(normalizedLocal) || normalizedLocal.version === 0) {
-				uploadQueue.push(path);
-			}
+			// 云端 manifest 缺条目时保守修复：重新发布本地文件记录。
+			uploadQueue.push(path);
 			continue;
 		}
 
@@ -390,5 +448,5 @@ export function computeSyncDelta(
 		}
 	}
 
-	return {uploadQueue, downloadQueue, deleteQueue, localDeleteQueue, conflictQueue, hashStitched};
+	return {uploadQueue, downloadQueue, deleteQueue, localDeleteQueue, conflictQueue, hashStitched, publishTombstoneQueue};
 }

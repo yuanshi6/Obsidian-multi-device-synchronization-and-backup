@@ -56,6 +56,10 @@ const defaultSettings: S3BackupSettings = {
 	accessKey: "", secretKey: "", endpoint: "", region: "",
 	bucketName: "", autoSync: false, syncInterval: 30,
 	excludePatterns: ".obsidian,.trash", deviceId: "dev1", deviceName: "test",
+	forcePathStyle: false,
+	storagePrefix: "_obsidian-sync/",
+	enableConditionalWrite: true,
+	enableOrphanCleanup: false,
 };
 
 describe("normalizeSyncPath", () => {
@@ -85,10 +89,10 @@ describe("computeSyncDelta", () => {
 			expect(delta.downloadQueue).toHaveLength(0);
 		});
 
-		it("skips already-versioned local file when cloud has no tombstone", () => {
+		it("repairs already-versioned local file when cloud has no tombstone", () => {
 			const local = {"notes/a.md": fs(1)};
 			const delta = computeSyncDelta(local, manifest());
-			expect(delta.uploadQueue).toHaveLength(0);
+			expect(delta.uploadQueue).toContain("notes/a.md");
 			expect(delta.downloadQueue).toHaveLength(0);
 		});
 	});
@@ -212,6 +216,13 @@ describe("computeSyncDelta", () => {
 			expect(delta.localDeleteQueue).toHaveLength(0);
 			expect(delta.uploadQueue).toHaveLength(0);
 		});
+
+		it("publishes a local tombstone even when cloud has no file or tombstone", () => {
+			const localTombs = {"notes/a.md": tomb(3, 2)};
+			const delta = computeSyncDelta({}, manifest(), "dev1", localTombs, {});
+			expect(delta.publishTombstoneQueue).toContain("notes/a.md");
+			expect(delta.deleteQueue).toHaveLength(0);
+		});
 	});
 
 	describe("empty inputs", () => {
@@ -250,7 +261,7 @@ describe("computeSyncDelta", () => {
 			expect(delta.uploadQueue).toContain("c.md");
 			expect(delta.downloadQueue).toContain("d.md");
 			expect(delta.hashStitched).toContain("e.md");
-			expect(delta.uploadQueue).not.toContain("b.md");
+			expect(delta.uploadQueue).toContain("b.md");
 		});
 	});
 });
@@ -379,5 +390,17 @@ describe("FileScanner", () => {
 
 		expect(Object.keys(result)).toHaveLength(1);
 		expect(result["notes/c.md"]).toBeDefined();
+	});
+
+	it("excludes only the root manifest.json compatibility file, not nested project manifests", async () => {
+		const adapter = mockAdapter({
+			"manifest.json": {mtime: 1000, size: 10, content: "root"},
+			"project/manifest.json": {mtime: 2000, size: 20, content: "project"},
+		});
+		const scanner = new FileScanner(adapter, defaultSettings);
+		const result = await scanner.scanAll();
+
+		expect(result["manifest.json"]).toBeUndefined();
+		expect(result["project/manifest.json"]).toBeDefined();
 	});
 });
