@@ -36,6 +36,13 @@ export default class S3SyncPlugin extends Plugin {
 	private suppressExpectedHashes: Map<string, string> = new Map();
 	private failedPathBackoff: Map<string, { lastFailedAt: number; count: number; nextRetryAt: number }> = new Map();
 
+	// ── 状态栏倒计时相关 ──
+	private nextAutoSyncAt = 0;
+	private nextDebouncedSyncAt = 0;
+	private statusCountdownTimer: number | null = null;
+	private currentStatusPhase: SyncPhase = "idle";
+	private doneStatusResetTimer: number | null = null;
+
 	// ── 观察者账本：内存级本地文件状态快照 ──
 	public localLedger: Record<string, FileState> = {};
 
@@ -85,6 +92,7 @@ export default class S3SyncPlugin extends Plugin {
 		// 状态栏
 		this.statusBarItem = this.addStatusBarItem();
 		this.updateStatusBar("idle");
+		this.startStatusCountdownTimer();
 
 		// 定时自动同步
 		this.setupAutoSync();
@@ -249,6 +257,14 @@ export default class S3SyncPlugin extends Plugin {
 		if (this.autoSyncTimer !== null) {
 			window.clearInterval(this.autoSyncTimer);
 			this.autoSyncTimer = null;
+		}
+		if (this.statusCountdownTimer !== null) {
+			window.clearInterval(this.statusCountdownTimer);
+			this.statusCountdownTimer = null;
+		}
+		if (this.doneStatusResetTimer !== null) {
+			window.clearTimeout(this.doneStatusResetTimer);
+			this.doneStatusResetTimer = null;
 		}
 		for (const timer of this.suppressTimers.values()) {
 			clearTimeout(timer);
@@ -617,8 +633,11 @@ export default class S3SyncPlugin extends Plugin {
 			window.clearTimeout(this.syncTimeout);
 		}
 
+		this.nextDebouncedSyncAt = Date.now() + DEBOUNCE_MS;
+
 		this.syncTimeout = window.setTimeout(() => {
 			this.syncTimeout = null;
+			this.nextDebouncedSyncAt = 0;
 			console.log("[S3 Sync] 全局防抖触发：3 秒无新操作，开始同步");
 
 			// 1. 持久化内存账本和墓碑
@@ -683,12 +702,49 @@ export default class S3SyncPlugin extends Plugin {
 
 	// ── 状态栏 ──
 
+	private formatCountdown(targetAt: number): string {
+		const remaining = Math.max(0, Math.ceil((targetAt - Date.now()) / 1000));
+		const m = Math.floor(remaining / 60);
+		const s = remaining % 60;
+		return `${m}:${String(s).padStart(2, "0")}`;
+	}
+
+	private getIdleStatusText(): string {
+		if (this.nextDebouncedSyncAt > Date.now()) {
+			return `☁ 就绪 · 待同步 ${this.formatCountdown(this.nextDebouncedSyncAt)}`;
+		}
+		if (this.settings.autoSync && Platform.isDesktop && this.nextAutoSyncAt > Date.now()) {
+			return `☁ 就绪 · 下次 ${this.formatCountdown(this.nextAutoSyncAt)}`;
+		}
+		return "☁ 就绪";
+	}
+
+	private startStatusCountdownTimer(): void {
+		if (this.statusCountdownTimer !== null) {
+			window.clearInterval(this.statusCountdownTimer);
+			this.statusCountdownTimer = null;
+		}
+		this.statusCountdownTimer = window.setInterval(() => {
+			if (this.currentStatusPhase === "idle" && this.statusBarItem) {
+				this.statusBarItem.setText(this.getIdleStatusText());
+			}
+		}, 1000) as unknown as number;
+	}
+
 	private updateStatusBar(phase: SyncPhase, progress?: { done: number; total: number }): void {
 		if (!this.statusBarItem) return;
 
+		// 清理旧的 done 重置定时器，防止覆盖新状态
+		if (this.doneStatusResetTimer !== null) {
+			window.clearTimeout(this.doneStatusResetTimer);
+			this.doneStatusResetTimer = null;
+		}
+
+		this.currentStatusPhase = phase;
+
 		switch (phase) {
 			case "idle":
-				this.statusBarItem.setText("☁ 就绪");
+				this.statusBarItem.setText(this.getIdleStatusText());
 				break;
 			case "scanning":
 				this.statusBarItem.setText("🔄 扫描中…");
@@ -704,7 +760,10 @@ export default class S3SyncPlugin extends Plugin {
 				break;
 			case "done":
 				this.statusBarItem.setText("✅ 同步完成");
-				setTimeout(() => this.updateStatusBar("idle"), 3000);
+				this.doneStatusResetTimer = window.setTimeout(() => {
+					this.doneStatusResetTimer = null;
+					this.updateStatusBar("idle");
+				}, 3000) as unknown as number;
 				break;
 		}
 	}
@@ -717,14 +776,17 @@ export default class S3SyncPlugin extends Plugin {
 			window.clearInterval(this.autoSyncTimer);
 			this.autoSyncTimer = null;
 		}
+		this.nextAutoSyncAt = 0;
 
 		if (!this.settings.autoSync) return;
 
 		const intervalMs = this.settings.syncInterval * 60 * 1000;
 
 		if (Platform.isDesktop) {
+			this.nextAutoSyncAt = Date.now() + intervalMs;
 			this.autoSyncTimer = window.setInterval(() => {
 				console.log("[S3 Sync] 自动同步触发，间隔：", this.settings.syncInterval, "分钟");
+				this.nextAutoSyncAt = Date.now() + intervalMs;
 				this.startSync(true);
 			}, intervalMs);
 			this.registerInterval(this.autoSyncTimer);
